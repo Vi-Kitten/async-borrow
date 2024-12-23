@@ -1,6 +1,6 @@
 use std::{cell::UnsafeCell, mem::MaybeUninit, ops::{Deref, DerefMut}, ptr::NonNull, sync::{atomic::{AtomicUsize, Ordering}, Mutex, PoisonError}, task::{Context, Poll, Waker}};
 
-use states::Owner;
+use states::{Owner, RefState};
 
 struct Contract<T> {
     /// The number of refereces pointing to the contract (includes weak references and owner).
@@ -11,13 +11,13 @@ struct Contract<T> {
     contract_state: Mutex<ContractState>,
 }
 
-struct ContractState {
+pub struct ContractState {
     /// The number of exotic references that could upgrade to become mutable (or are already mutable).
     exotic_count: usize,
     /// The number of strong references held.
     borrow_count: usize,
     /// Number of mutable borrows thusfar (counts upgrading, owner re-aquisition and dropping).
-    mut_number: usize,
+    mut_number: u64,
     /// Contains queued borrows
     wakers: BorrowStack,
 }
@@ -86,7 +86,10 @@ impl ContractState {
         self.handle_wake_info(&info);
         match info.final_wake {
             stack::BorrowKind::Mut | stack::BorrowKind::Exotic | stack::BorrowKind::Ref => AdditionalWork::Nope,
-            stack::BorrowKind::Skip => AdditionalWork::Drop,
+            stack::BorrowKind::Skip => {
+                self.mut_number += 1;
+                AdditionalWork::Drop
+            },
         }
     }
 }
@@ -348,6 +351,7 @@ mod states {
         const BORROW_KIND: BorrowKind = BorrowKind::Mut;
 
         fn un_borrow(self, state: &mut ContractState) -> AdditionalWork {
+            let _ = state;
             AdditionalWork::Drop
         }
     }
@@ -358,10 +362,10 @@ mod states {
         }
     }
 
-    pub struct Weak(usize);
+    pub struct Weak(pub u64);
     impl PtrState for Weak {}
     impl Weak {
-        pub fn try_upgrade(self, mut_number: usize) -> Result<Ref, Empty> {
+        pub fn try_upgrade(self, mut_number: u64) -> Result<Ref, Empty> {
             if self.0 == mut_number {
                 Ok(Ref)
             } else {
@@ -383,7 +387,7 @@ mod states {
         }
     }
     impl Ref {
-        pub fn downgrade(self, mut_number: usize) -> Weak {
+        pub fn downgrade(self, mut_number: u64) -> Weak {
             Weak(mut_number)
         }
     }
@@ -437,12 +441,12 @@ mod states {
     }
 }
 
-struct Pointer<T, S: states::PtrState> {
+pub struct Pointer<T, S: states::PtrState> {
     /// only valid to be uninit if about to forget
     inner: MaybeUninit<PointerInner<T, S>>
 }
 
-struct PointerInner<T, S: states::PtrState> {
+pub struct PointerInner<T, S: states::PtrState> {
     state: S,
     contract: NonNull<Contract<T>>,
 }
@@ -471,6 +475,89 @@ impl<T, S: states::PtrState> Pointer<T, S> {
     fn handle_drop(inner: PointerInner<T, S>) -> Self {
         Pointer {
             inner: MaybeUninit::new(inner)
+        }
+    }
+
+    fn new_ptr<R: states::PtrState>(&self, state: R) -> Pointer<T, R> {
+        self.contract().ref_count.fetch_add(1, Ordering::Relaxed);
+        Pointer::handle_drop(PointerInner { state, contract: self.contract })
+    }
+}
+
+impl<T, S: states::RefState> Pointer<T, S> {
+    pub fn get_ref(&self) -> &T {
+        unsafe { self.contract().value.get().as_ref().unwrap_unchecked().assume_init_ref() }
+    }
+}
+
+impl<T, S: states::RefMutState> Pointer<T, S> {
+    pub fn get_mut(&mut self) -> &mut T {
+        unsafe { self.contract().value.get().as_mut().unwrap_unchecked().assume_init_mut() }
+    }
+}
+
+impl<T> Pointer<T, states::Weak> {
+    fn upgrade_inner(self) -> Result<Pointer<T, states::Ref>, Pointer<T, states::Empty>> {
+        // TODO: handle panics
+        let PointerInner { state, contract } = self.into_inner();
+        let mut contract_state = unsafe { contract.as_ref().contract_state.lock().unwrap() };
+        match state.try_upgrade(contract_state.mut_number) {
+            Ok(state) => {
+                contract_state.record_borrow_acquire(states::Ref::BORROW_KIND);
+                Ok(Pointer::handle_drop(PointerInner { state, contract }))
+            },
+            Err(state) => Err(Pointer::handle_drop(PointerInner { state, contract })),
+        }
+    }
+
+    pub fn upgrade(self) -> Option<Pointer<T, states::Ref>> {
+        self.upgrade_inner().ok()
+    }
+}
+
+impl<T> Pointer<T, states::Ref> {
+    pub fn downgrade(&self) -> Pointer<T, states::Weak> {
+        // TODO: handle panics
+        let mut_number = self.contract().contract_state.lock().unwrap().mut_number;
+        self.new_ptr(states::Weak(mut_number))
+    }
+}
+
+impl<T> Pointer<T, states::UpgradableRef> {
+    pub fn into_ref(self) -> Pointer<T, states::Ref> {
+        // TODO: handle panics
+        let PointerInner { state, contract } = self.into_inner();
+        let mut contract_state = unsafe { contract.as_ref().contract_state.lock().unwrap() };
+        contract_state.record_borrow_release(states::RefMut::BORROW_KIND);
+        contract_state.record_borrow_acquire(states::Ref::BORROW_KIND);
+        if contract_state.exotic_count == 0 { contract_state.wake_from_inexotic() };
+        drop(contract_state);
+        Pointer::handle_drop(PointerInner { state: state.into_ref(), contract })
+    }
+}
+
+impl<T> Pointer<T, states::RefMut> {
+    pub fn into_ref(self) -> Pointer<T, states::Ref> {
+        // TODO: handle panics
+        let PointerInner { state, contract } = self.into_inner();
+        let mut contract_state = unsafe { contract.as_ref().contract_state.lock().unwrap() };
+        contract_state.record_borrow_release(states::RefMut::BORROW_KIND);
+        contract_state.record_borrow_acquire(states::Ref::BORROW_KIND);
+        contract_state.wake_from_inexotic();
+        drop(contract_state);
+        Pointer::handle_drop(PointerInner { state: state.into_ref(), contract })
+    }
+}
+
+impl<T, S: states::PtrState> Drop for Pointer<T, S> {
+    fn drop(&mut self) {
+        let PointerInner { state, contract } = unsafe { std::mem::replace(&mut self.inner, MaybeUninit::uninit()).assume_init() };
+        match state.un_track(&unsafe { contract.as_ref() }.contract_state) {
+            AdditionalWork::Nope => (),
+            AdditionalWork::Drop => unsafe { contract.as_ref().value.get().as_mut().unwrap_unchecked().assume_init_drop() },
+        }
+        if unsafe { contract.as_ref() }.ref_count.fetch_sub(1, Ordering::Release) == 1 {
+            drop(unsafe { Box::from_raw(contract.as_ptr()) })
         }
     }
 }
@@ -549,19 +636,6 @@ impl<T> Pointer<T, states::Owner> {
         let value = unsafe { std::mem::replace(self.contract().value.get().as_mut().unwrap_unchecked(), MaybeUninit::uninit()).assume_init() };
         drop(Pointer::handle_drop(self.into_inner().map_state(|_| states::Empty)));
         value
-    }
-}
-
-impl<T, S: states::PtrState> Drop for Pointer<T, S> {
-    fn drop(&mut self) {
-        let PointerInner { state, contract } = unsafe { std::mem::replace(&mut self.inner, MaybeUninit::uninit()).assume_init() };
-        match state.un_track(&unsafe { contract.as_ref() }.contract_state) {
-            AdditionalWork::Nope => (),
-            AdditionalWork::Drop => unsafe { contract.as_ref().value.get().as_mut().unwrap_unchecked().assume_init_drop() },
-        }
-        if unsafe { contract.as_ref() }.ref_count.fetch_sub(1, Ordering::Release) == 1 {
-            drop(unsafe { Box::from_raw(contract.as_ptr()) })
-        }
     }
 }
 
