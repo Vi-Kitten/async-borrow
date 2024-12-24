@@ -315,7 +315,7 @@ mod stack {
 
 use stack::{BorrowId, BorrowStack, WakeInfo};
 
-mod states {
+pub mod states {
     use stack::BorrowKind;
 
     use super::*;
@@ -362,6 +362,7 @@ mod states {
         }
     }
 
+    #[derive(Clone)]
     pub struct Weak(pub u64);
     impl PtrState for Weak {}
     impl Weak {
@@ -374,6 +375,7 @@ mod states {
         }
     }
 
+    #[derive(Clone)]
     pub struct Ref;
     unsafe impl RefState for Ref {
         const BORROW_KIND: BorrowKind = BorrowKind::Ref;
@@ -392,6 +394,7 @@ mod states {
         }
     }
 
+    #[derive(Clone)]
     pub struct UpgradableRef;
     unsafe impl RefState for UpgradableRef {
         const BORROW_KIND: BorrowKind = BorrowKind::Exotic;
@@ -524,15 +527,11 @@ impl<T> Pointer<T, states::Ref> {
 }
 
 impl<T> Pointer<T, states::UpgradableRef> {
-    pub fn into_ref(self) -> Pointer<T, states::Ref> {
+    pub fn as_ref(&self) -> Pointer<T, states::Ref> {
         // TODO: handle panics
-        let PointerInner { state, contract } = self.into_inner();
-        let mut contract_state = unsafe { contract.as_ref().contract_state.lock().unwrap() };
-        contract_state.record_borrow_release(states::RefMut::BORROW_KIND);
-        contract_state.record_borrow_acquire(states::Ref::BORROW_KIND);
-        if contract_state.exotic_count == 0 { contract_state.wake_from_inexotic() };
-        drop(contract_state);
-        Pointer::handle_drop(PointerInner { state: state.into_ref(), contract })
+        self.contract().contract_state.lock().unwrap().record_borrow_acquire(states::Ref::BORROW_KIND);
+        let ref_state = self.state.clone().into_ref();
+        self.new_ptr(ref_state)
     }
 }
 
@@ -546,6 +545,16 @@ impl<T> Pointer<T, states::RefMut> {
         contract_state.wake_from_inexotic();
         drop(contract_state);
         Pointer::handle_drop(PointerInner { state: state.into_ref(), contract })
+    }
+
+    pub fn downgrade(self) -> Pointer<T, states::UpgradableRef> {
+        // TODO: handle panics
+        let PointerInner { state, contract } = self.into_inner();
+        let mut contract_state = unsafe { contract.as_ref().contract_state.lock().unwrap() };
+        contract_state.record_borrow_release(states::RefMut::BORROW_KIND);
+        contract_state.record_borrow_acquire(states::UpgradableRef::BORROW_KIND);
+        drop(contract_state);
+        Pointer::handle_drop(PointerInner { state: state.downgrade(), contract })
     }
 }
 
