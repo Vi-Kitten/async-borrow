@@ -1,4 +1,4 @@
-use std::{ops::{Deref, DerefMut}, pin::Pin};
+use std::{marker::PhantomData, ops::{Deref, DerefMut}, pin::Pin};
 
 pub(crate) mod contract;
 pub mod scope;
@@ -8,14 +8,20 @@ pub mod collections;
 // TODO: Type parameter varience checks
 // TODO: Miri safety checks
 
-pub struct Weak<T> {
-    inner: contract::Pointer<T, contract::states::Weak>
+pub struct Weak</* Out */ T> {
+    inner: contract::Pointer<T, contract::states::Weak>,
+    _varience: PhantomData<*const T>
 }
+
+unsafe impl<T: Sync> Sync for Weak<T> {}
+
+unsafe impl<T: Sync> Send for Weak<T> {}
 
 impl<T> Weak<T> {
     fn from_raw(inner: contract::Pointer<T, contract::states::Weak>) -> Weak<T> {
         Weak {
-            inner
+            inner,
+            _varience: PhantomData
         }
     }
 
@@ -28,9 +34,14 @@ impl<T> Weak<T> {
     }
 }
 
-pub struct Ref<T> {
-    inner: contract::Pointer<T, contract::states::Ref>
+pub struct Ref</* Out */ T> {
+    inner: contract::Pointer<T, contract::states::Ref>,
+    _varience: PhantomData<*const T>
 }
+
+unsafe impl<T: Sync> Sync for Ref<T> {}
+
+unsafe impl<T: Sync> Send for Ref<T> {}
 
 impl<T> Deref for Ref<T> {
     type Target = T;
@@ -43,7 +54,8 @@ impl<T> Deref for Ref<T> {
 impl<T> Ref<T> {
     fn from_raw(inner: contract::Pointer<T, contract::states::Ref>) -> Ref<T> {
         Ref {
-            inner
+            inner,
+            _varience: PhantomData
         }
     }
 
@@ -54,11 +66,20 @@ impl<T> Ref<T> {
     pub fn unpin(ptr: Pin<Ref<T>>) -> Ref<T> {
         unsafe { Pin::into_inner_unchecked(ptr) }
     }
+
+    pub fn downgrade(&self) -> Weak<T> {
+        Weak::from_raw(self.inner.downgrade())
+    }
 }
 
-pub struct UpgRef<T> {
-    inner: contract::Pointer<T, contract::states::UpgradableRef>
+pub struct UpgRef</* Mix */ T> {
+    inner: contract::Pointer<T, contract::states::UpgradableRef>,
+    _varience: PhantomData<*mut T>
 }
+
+unsafe impl<T: Sync> Sync for UpgRef<T> {}
+
+unsafe impl<T: Sync + Send> Send for UpgRef<T> {}
 
 impl<T> Deref for UpgRef<T> {
     type Target = T;
@@ -71,7 +92,8 @@ impl<T> Deref for UpgRef<T> {
 impl<T> UpgRef<T> {
     fn from_raw(inner: contract::Pointer<T, contract::states::UpgradableRef>) -> UpgRef<T> {
         UpgRef {
-            inner
+            inner,
+            _varience: PhantomData
         }
     }
 
@@ -98,9 +120,14 @@ impl<T> UpgRef<T> {
     }
 }
 
-pub struct Mut<T> {
-    inner: contract::Pointer<T, contract::states::RefMut>
+pub struct Mut</* Mix */ T> {
+    inner: contract::Pointer<T, contract::states::RefMut>,
+    _varience: PhantomData<*mut T>
 }
+
+unsafe impl<T: Sync> Sync for Mut<T> {}
+
+unsafe impl<T: Send> Send for Mut<T> {}
 
 impl<T> Deref for Mut<T> {
     type Target = T;
@@ -119,7 +146,8 @@ impl<T> DerefMut for Mut<T> {
 impl<T> Mut<T> {
     fn from_raw(inner: contract::Pointer<T, contract::states::RefMut>) -> Mut<T> {
         Mut {
-            inner
+            inner,
+            _varience: PhantomData
         }
     }
 
