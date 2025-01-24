@@ -2,6 +2,8 @@ use std::{collections::VecDeque, future::Future, sync::Arc};
 
 use super::*;
 
+// MARK: Node
+
 /// The status of a borrow forward node
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
@@ -44,7 +46,7 @@ impl LastInteraction {
         match self {
             LastInteraction::NonBlocking => QueueActionFollowup::Done,
             LastInteraction::Blocked(borrow_kind) => if borrow_kind.would_wake(kind) {
-                std::mem::replace(self, self.reset_state());
+                *self = self.reset_state();
                 QueueActionFollowup::Prompt
             } else {
                 QueueActionFollowup::Done
@@ -67,11 +69,29 @@ pub struct BorrowQueueNode {
     next: Option<Arc<Mutex<BorrowQueueNode>>>,
 }
 
+/// After performing an action involving the borrow queue, you may need to prompt the contract to wake new borrows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueActionFollowup {
     // ensure that you release the mutex for this node before attempting a drain or even locking the contract.
     Prompt,
     Done,
+}
+
+impl QueueActionFollowup {
+    pub fn handle_for<T, S: PtrState>(self, ptr: &PointerInner<T, S>) {
+        match self {
+            QueueActionFollowup::Prompt => {
+                // TODO: handle panic
+                match ptr.contract().contract_state.lock().unwrap().prompt_wakes() {
+                    AdditionalWork::Noop => (),
+                    AdditionalWork::Drop => unsafe {
+                        MaybeUninit::assume_init_drop(ptr.contract().value.get().as_mut().unwrap_unchecked());
+                    },
+                }
+            }
+            QueueActionFollowup::Done => ()
+        }
+    }
 }
 
 impl Default for QueueActionFollowup {
@@ -102,7 +122,7 @@ impl BorrowQueueNode {
         }
     }
 
-    pub fn get_mut(&mut self, id: &BorrowId) -> Option<&mut BorrowWaker> {
+    fn get_mut(&mut self, id: &BorrowId) -> Option<&mut BorrowWaker> {
         let n = id.index.checked_sub(self.popped)?;
         self.queue.get_mut(n as usize)
     }
@@ -117,10 +137,11 @@ impl BorrowQueueNode {
         }
     }
 
-    pub fn close_waker(&mut self, id: &BorrowId) -> Option<()> {
+    #[must_use]
+    pub fn close_waker(&mut self, id: &BorrowId) -> Option<QueueActionFollowup> {
         let borrow_waker = self.get_mut(id)?;
         borrow_waker.kind = BorrowKind::Empty;
-        Some(())
+        Some(self.last_interaction.generate_followup(&BorrowKind::Empty))
     }
 
     /// If result is not used a deadlock could occur
@@ -231,6 +252,49 @@ impl BorrowQueueNode {
         }
     }
 }
+
+// MARK: Forwarding
+
+pub struct BorrowBranch<T> {
+    pub node: Arc<Mutex<BorrowQueueNode>>,
+    pub privillage: states::RefMut,
+    pub ptr: Pointer<T, states::Borrowless>
+}
+
+impl<T> BorrowBranch<T> {
+    pub fn interject(&mut self) -> Self {
+        let mut node = self.node.lock().unwrap();
+        let mut next_node = Arc::new(Mutex::new(BorrowQueueNode::new_forward(node.next.take())));
+        node.next = Some(next_node.clone());
+        drop(node);
+        std::mem::swap(&mut self.node, &mut next_node);
+        BorrowBranch {
+            node: next_node,
+            privillage: unsafe { self.privillage.use_as_forward() },
+            ptr: self.ptr.new_ptr(states::Borrowless)
+        }
+    }
+}
+
+impl<T> Drop for BorrowBranch<T> {
+    fn drop(&mut self) {
+        let Ok(mut node) = self.node.lock() else {
+            // so not my problem :3
+            return;
+        };
+        node.status = NodeStatus::Shrinking;
+        if node.queue.len() != 0 {
+            // if there are borrows then either they are awaiting in which case have responsibility
+            // or they are empty in which case they will be handling prompting
+            return;
+        }
+        let followup = node.last_interaction.generate_followup(&BorrowKind::Empty);
+        drop(node);
+        followup.handle_for(&*self.ptr);
+    }
+}
+
+// MARK: Wakers
 
 pub struct BorrowId {
     // u64 to ensure it can count is high enough
@@ -348,6 +412,8 @@ impl Future for BorrowFuture {
     }
 }
 
+// MARK: Queue
+
 /// If owner is None, then owner has been dropped or owner has been awoken, either way no communication between owner and borrowers is required.
 pub enum BorrowQueue {
     /// Only the owner is left awaiting.
@@ -373,16 +439,43 @@ impl BorrowQueue {
         }
     }
 
+    pub fn push_node(&mut self) -> Arc<Mutex<BorrowQueueNode>> {
+        match std::mem::replace(self, BorrowQueue::new()) {
+            BorrowQueue::Final { owner } => {
+                let node = Arc::new(Mutex::new(BorrowQueueNode::new_forward(None)));
+                *self = BorrowQueue::Forwarded { owner, next: node.clone() };
+                node
+            },
+            BorrowQueue::Upgrading { owner, upgrades } => {
+                upgrades.lock().unwrap().last_interaction = LastInteraction::NonBlocking;
+                let node = Arc::new(Mutex::new(BorrowQueueNode::new_forward(Some(upgrades))));
+                *self = BorrowQueue::Forwarded { owner, next: node.clone() };
+                node
+            },
+            BorrowQueue::Forwarded { owner, next } => {
+                next.lock().unwrap().last_interaction = LastInteraction::NonBlocking;
+                let node = Arc::new(Mutex::new(BorrowQueueNode::new_forward(Some(next))));
+                *self = BorrowQueue::Forwarded { owner, next: node.clone() };
+                node
+            },
+        }
+    }
+
     pub fn queue_upgrade(&mut self) -> BorrowFuture {
         match std::mem::replace(self, BorrowQueue::new()) {
             BorrowQueue::Final { owner } => *self = BorrowQueue::Upgrading {
                 owner,
                 upgrades: Arc::new(Mutex::new(BorrowQueueNode::new_upgrade_queue(None)))
             },
-            BorrowQueue::Upgrading {..} => (),
-            BorrowQueue::Forwarded { owner, next } => *self = BorrowQueue::Upgrading {
-                owner,
-                upgrades: Arc::new(Mutex::new(BorrowQueueNode::new_upgrade_queue(Some(next))))
+            this@BorrowQueue::Upgrading {..} => *self = this,
+            BorrowQueue::Forwarded { owner, next } => {
+                // TODO: handle panic
+                // will never be blocking whilst queueing
+                next.lock().unwrap().last_interaction = LastInteraction::NonBlocking;
+                *self = BorrowQueue::Upgrading {
+                    owner,
+                    upgrades: Arc::new(Mutex::new(BorrowQueueNode::new_upgrade_queue(Some(next))))
+                }
             },
         };
         // self is now garunteed to be `BorrowQueue::Upgrading`

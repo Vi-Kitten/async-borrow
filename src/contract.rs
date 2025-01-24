@@ -4,7 +4,7 @@ mod borrow_queue;
 pub mod states;
 
 use states::{Owner, PtrState, RefState};
-use borrow_queue::{BorrowId, BorrowKind, BorrowQueue};
+use borrow_queue::{BorrowBranch, BorrowId, BorrowKind, BorrowQueue};
 
 // MARK: Contract
 
@@ -29,6 +29,7 @@ impl ContractState {
         ContractState { counts: ContractCounts::new(), wakers: BorrowQueue::new() }
     }
 
+    #[must_use]
     pub fn reduce_borrow(&mut self, from: &BorrowKind) -> AdditionalWork {
         if self.counts.borrow_count == 0 {
             self.wake_from(BorrowKind::Empty)
@@ -36,6 +37,17 @@ impl ContractState {
             self.wake_from(BorrowKind::Ref)
         } else {
             AdditionalWork::Noop
+        }
+    }
+
+    #[must_use]
+    pub fn prompt_wakes(&mut self) -> AdditionalWork {
+        if self.counts.borrow_count == 0 {
+            self.wake_from(BorrowKind::Empty)
+        } else if self.counts.exotic_count == 0 {
+            self.wake_from(BorrowKind::Ref)
+        } else {
+            self.wake_from(BorrowKind::Mut)
         }
     }
 
@@ -55,6 +67,7 @@ impl ContractState {
         self.counts.record_borrow_acquire(to);
     }
 
+    #[must_use]
     pub fn wake_from(&mut self, kind: BorrowKind) -> AdditionalWork {
         self.wakers.wake_from(kind, &mut self.counts)
     }
@@ -67,6 +80,10 @@ impl ContractState {
             },
             None => Poll::Ready(()),
         }
+    }
+
+    pub fn start_lease(&mut self) {
+        *self.wakers.owner_waker() = Some(futures::task::noop_waker())
     }
 
     pub fn cancel_reaquire(&mut self) -> Option<()> {
@@ -102,7 +119,7 @@ impl ContractCounts {
                 self.borrow_count += 1;
             }
             BorrowKind::Ref => {
-                self.exotic_count += 1
+                self.exotic_count += 1;
             },
             BorrowKind::Empty => (),
         }
@@ -115,20 +132,20 @@ impl ContractCounts {
                 self.borrow_count -= 1;
             },
             BorrowKind::Ref => {
-                self.exotic_count -= 1
+                self.exotic_count -= 1;
             },
             BorrowKind::Empty => (),
         }
     }
 }
 
-// MARK: Pointers
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdditionalWork {
     Noop,
     Drop,
 }
+
+// MARK: Pointers
 
 pub struct Pointer<T, S: states::PtrState> {
     /// only valid to be uninit if about to forget
@@ -161,19 +178,14 @@ impl<T, S: states::PtrState> Pointer<T, S> {
         inner
     }
 
-    fn handle_drop(inner: PointerInner<T, S>) -> Self {
+    fn from_inner(inner: PointerInner<T, S>) -> Self {
         Pointer {
             inner: MaybeUninit::new(inner)
         }
     }
-
-    fn new_ptr<R: states::PtrState>(&self, state: R) -> Pointer<T, R> {
-        self.contract().ref_count.fetch_add(1, Ordering::Relaxed);
-        Pointer::handle_drop(PointerInner { state, contract: self.contract })
-    }
 }
 
-impl<T, S: PtrState> Pointer<T, S> {
+impl<T, S: PtrState> PointerInner<T, S> {
     pub unsafe fn get_ref_unchecked(&self) -> &T {
         self.contract().value.get().as_ref().unwrap_unchecked().assume_init_ref()
     }
@@ -181,31 +193,36 @@ impl<T, S: PtrState> Pointer<T, S> {
     pub unsafe fn get_mut_unchecked(&mut self) -> &mut T {
         self.contract().value.get().as_mut().unwrap_unchecked().assume_init_mut()
     }
+
+    fn new_ptr<R: states::PtrState>(&self, state: R) -> Pointer<T, R> {
+        self.contract().ref_count.fetch_add(1, Ordering::Relaxed);
+        Pointer::from_inner(PointerInner { state, contract: self.contract })
+    }
 }
 
-impl<T, S: states::RefState> Pointer<T, S> {
+impl<T, S: states::RefState> PointerInner<T, S> {
     pub fn get_ref(&self) -> &T {
         unsafe { self.get_ref_unchecked() }
     }
 }
 
-impl<T, S: states::RefMutState> Pointer<T, S> {
+impl<T, S: states::RefMutState> PointerInner<T, S> {
     pub fn get_mut(&mut self) -> &mut T {
         unsafe { self.get_mut_unchecked() }
     }
 }
 
 impl<T> Pointer<T, states::Weak> {
-    fn upgrade_inner(self) -> Result<Pointer<T, states::Ref>, Pointer<T, states::Empty>> {
+    fn upgrade_inner(self) -> Result<Pointer<T, states::Ref>, Pointer<T, states::Borrowless>> {
         // TODO: handle panics
         let PointerInner { state, contract } = self.into_inner();
         let mut contract_state = unsafe { contract.as_ref().contract_state.lock().unwrap() };
         match state.try_upgrade(contract_state.counts.mut_number) {
             Ok(state) => {
                 contract_state.cast_borrow(&BorrowKind::Empty, &states::Ref::BORROW_KIND);
-                Ok(Pointer::handle_drop(PointerInner { state, contract }))
+                Ok(Pointer::from_inner(PointerInner { state, contract }))
             },
-            Err(state) => Err(Pointer::handle_drop(PointerInner { state, contract })),
+            Err(state) => Err(Pointer::from_inner(PointerInner { state, contract })),
         }
     }
 
@@ -214,7 +231,7 @@ impl<T> Pointer<T, states::Weak> {
     }
 }
 
-impl<T> Pointer<T, states::Ref> {
+impl<T> PointerInner<T, states::Ref> {
     pub fn downgrade(&self) -> Pointer<T, states::Weak> {
         // TODO: handle panics
         let mut_number = self.contract().contract_state.lock().unwrap().counts.mut_number;
@@ -222,7 +239,7 @@ impl<T> Pointer<T, states::Ref> {
     }
 }
 
-impl<T> Pointer<T, states::UpgradableRef> {
+impl<T> PointerInner<T, states::UpgradableRef> {
     pub fn as_ref(&self) -> Pointer<T, states::Ref> {
         // TODO: handle panics
         self.contract().contract_state.lock().unwrap().counts.record_borrow_acquire(&states::Ref::BORROW_KIND);
@@ -238,7 +255,7 @@ impl<T> Pointer<T, states::RefMut> {
         let mut contract_state = unsafe { contract.as_ref().contract_state.lock().unwrap() };
         contract_state.cast_borrow(&states::RefMut::BORROW_KIND, &states::Ref::BORROW_KIND);
         drop(contract_state);
-        Pointer::handle_drop(PointerInner { state: state.into_ref(), contract })
+        Pointer::from_inner(PointerInner { state: state.into_ref(), contract })
     }
 
     pub fn downgrade(self) -> Pointer<T, states::UpgradableRef> {
@@ -248,7 +265,20 @@ impl<T> Pointer<T, states::RefMut> {
         // this cast will never prompt and wakes as future ptrs expect all potential mutation to cease until waking, including by upgradable refs
         contract_state.silent_cast_borrow(&states::RefMut::BORROW_KIND, &states::UpgradableRef::BORROW_KIND);
         drop(contract_state);
-        Pointer::handle_drop(PointerInner { state: state.downgrade(), contract })
+        Pointer::from_inner(PointerInner { state: state.downgrade(), contract })
+    }
+
+    pub fn forward(mut self) -> borrow_queue::BorrowBranch<T> {
+        let mut contract_state = self.contract().contract_state.lock().unwrap();
+        let node = contract_state.wakers.push_node();
+        drop(contract_state);
+        let ptr = self.new_ptr(states::Borrowless);
+        let privillage = unsafe { self.state.use_as_forward() };
+        BorrowBranch {
+            node,
+            privillage,
+            ptr,
+        }
     }
 }
 
@@ -270,19 +300,21 @@ impl<T, S: states::PtrState> PointerInner<T, S> {
         unsafe { self.contract.as_ref() }
     }
 
-    pub fn get_ref(&self) -> &T where S: states::RefState {
-        unsafe { self.contract().value.get().as_ref().unwrap_unchecked().assume_init_ref() }
-    }
-
-    pub fn get_mut(&mut self) -> &mut T where S: states::RefMutState {
-        unsafe { self.contract().value.get().as_mut().unwrap_unchecked().assume_init_mut() }
-    }
-
     fn map_state<Q: states::PtrState>(self, f: impl FnOnce(S) -> Q) -> PointerInner<T, Q> {
         PointerInner {
             state: (f)(self.state),
             contract: self.contract
         }
+    }
+}
+
+impl<T> PointerInner<T, states::Owner> {
+    pub fn get_ref_unique(&self) -> &T {
+        unsafe { self.get_ref_unchecked() }
+    }
+
+    pub fn get_mut_unique(&mut self) -> &mut T {
+        unsafe { self.get_mut_unchecked() }
     }
 }
 
@@ -295,14 +327,48 @@ impl<T> Pointer<T, states::Owner> {
         };
         let contract = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(contract))) };
         let state = unsafe { Owner::init() };
-        Pointer::handle_drop(PointerInner { state, contract })
+        Pointer::from_inner(PointerInner { state, contract })
     }
 
     pub fn take_value(self) -> T {
         let value = unsafe { std::mem::replace(self.contract().value.get().as_mut().unwrap_unchecked(), MaybeUninit::uninit()).assume_init() };
-        drop(Pointer::handle_drop(self.into_inner().map_state(|_| states::Empty)));
+        drop(Pointer::from_inner(self.into_inner().map_state(|_| states::Borrowless)));
         value
     }
+
+    pub fn borrow_ref(self) -> (Pointer<T, states::Host>, Pointer<T, states::Ref>) {
+        let mut inner = self.into_inner();
+        // Todo: handle panic
+        let mut contract_state = inner.contract().contract_state.lock().unwrap();
+        contract_state.counts.record_borrow_acquire(&states::Ref::BORROW_KIND);
+        contract_state.start_lease();
+        drop(contract_state);
+        let ref_state = inner.state.share_ref();
+        let borrow = inner.new_ptr(ref_state);
+        let host = Pointer::from_inner(inner.map_state(Owner::shared));
+        (host, borrow)
+    }
+
+    pub fn borrow_mut(self) -> (Pointer<T, states::Host>, Pointer<T, states::RefMut>) {
+        let mut inner = self.into_inner();
+        // Todo: handle panic
+        let mut contract_state = inner.contract().contract_state.lock().unwrap();
+        contract_state.counts.record_borrow_acquire(&states::RefMut::BORROW_KIND);
+        contract_state.start_lease();
+        drop(contract_state);
+        let ref_mut_state = inner.state.share_mut();
+        let borrow = inner.new_ptr(ref_mut_state);
+        let host = Pointer::from_inner(inner.map_state(Owner::shared));
+        (host, borrow)
+    }
+}
+
+impl<T> Pointer<T, states::Host> {
+    pub fn acquire(self: Self) -> ReacquisitionFuture<T> {
+        ReacquisitionFuture {
+            host: Some(self)
+        }
+    } 
 }
 
 // MARK: Reacquire
@@ -327,17 +393,9 @@ impl<T> futures::Future for ReacquisitionFuture<T> {
         drop(contract);
         poll.map(|_| {
             // this is valid because we know that host is Some
-            Pointer::handle_drop(unsafe { self.host.take().unwrap_unchecked().into_inner().map_state(|s| s.assert_unshared() ) })
+            Pointer::from_inner(unsafe { self.host.take().unwrap_unchecked().into_inner().map_state(|s| s.assert_unshared()) })
         })
     }
-}
-
-impl<T> Pointer<T, states::Host> {
-    pub fn acquire(self: Self) -> ReacquisitionFuture<T> {
-        ReacquisitionFuture {
-            host: Some(self)
-        }
-    } 
 }
 
 // MARK: Future Borrow
@@ -361,7 +419,7 @@ impl<T, S: states::PtrState> FuturePointer<T, S> {
         poll.map(|_| {
             let _ = pointer;
             // safe as we would have already panicked if this was not the case
-            Pointer::handle_drop(unsafe { self.inner.take().unwrap_unchecked() }.0)
+            Pointer::from_inner(unsafe { self.inner.take().unwrap_unchecked() }.0)
         })
     }
 }
@@ -373,12 +431,14 @@ impl<T, S: states::PtrState> Drop for FuturePointer<T, S> {
         };
         // TODO: handle panic
         let mut node = queue.lock().unwrap();
-        if let Some(()) = node.close_waker(&self.id) {
-            drop(Pointer::handle_drop(pointer.map_state(|_| states::Empty)));
+        if let Some(followup) = node.close_waker(&self.id) {
+            drop(node);
+            followup.handle_for(&pointer);
+            drop(Pointer::from_inner(pointer.map_state(|_| states::Borrowless)));
             return;
-        } 
+        }
         drop(node);
-        drop(Pointer::handle_drop(pointer))
+        drop(Pointer::from_inner(pointer))
     }
 }
 

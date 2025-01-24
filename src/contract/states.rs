@@ -3,6 +3,7 @@ use borrow_queue::BorrowKind;
 use super::*;
 
 pub trait PtrState: Sized {
+    #[must_use]
     fn un_track(self, state: &Mutex<ContractState>) -> AdditionalWork {
         let _ = state;
         AdditionalWork::Noop
@@ -23,8 +24,9 @@ impl<T: RefState> PtrState for T {
 }
 pub unsafe trait RefMutState: RefState {}
 
-pub struct Empty;
-impl PtrState for Empty {}
+#[derive(Clone, Copy)]
+pub struct Borrowless;
+impl PtrState for Borrowless {}
 
 pub struct Owner;
 impl PtrState for Owner {
@@ -40,6 +42,14 @@ impl Owner {
 
     pub fn shared(self) -> Host {
         Host
+    }
+
+    pub fn share_ref(&mut self) -> Ref {
+        Ref
+    }
+
+    pub fn share_mut(&mut self) -> RefMut {
+        RefMut
     }
 }
 
@@ -66,11 +76,11 @@ impl Host {
 pub struct Weak(pub u64);
 impl PtrState for Weak {}
 impl Weak {
-    pub fn try_upgrade(self, mut_number: u64) -> Result<Ref, Empty> {
+    pub fn try_upgrade(self, mut_number: u64) -> Result<Ref, Borrowless> {
         if self.0 == mut_number {
             Ok(Ref)
         } else {
-            Err(Empty)
+            Err(Borrowless)
         }
     }
 }
@@ -121,5 +131,9 @@ impl RefMut {
 
     pub fn downgrade(self) -> UpgradableRef {
         UpgradableRef
+    }
+
+    pub unsafe fn use_as_forward(&mut self) -> RefMut {
+        RefMut
     }
 }
