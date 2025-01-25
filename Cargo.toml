@@ -5,3 +5,7 @@ edition = "2021"
 
 [dependencies]
 futures = "0.3.31"
+
+[dev-dependencies]
+tokio = { features=["rt", "macros", "time"], version="1.43.0" }
+tokio-macros = "1.*"

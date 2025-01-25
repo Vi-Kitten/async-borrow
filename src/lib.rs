@@ -1,4 +1,4 @@
-use std::{cell::UnsafeCell, future::Future, marker::PhantomData, mem::MaybeUninit, ops::{Deref, DerefMut}, pin::Pin, ptr::NonNull, sync::{atomic::{AtomicUsize, Ordering}, Mutex}, task::Waker, usize};
+use std::{cell::UnsafeCell, fmt::Debug, future::Future, marker::PhantomData, mem::MaybeUninit, ops::{Deref, DerefMut}, pin::Pin, ptr::NonNull, sync::{atomic::{AtomicUsize, Ordering}, Mutex}, task::Waker, usize};
 
 use futures::{future::FusedFuture, FutureExt};
 
@@ -8,12 +8,14 @@ pub mod collections;
 
 // MARK: Inner
 
+#[derive(Debug)]
 struct BorrowInner<T> {
     weak: AtomicUsize,
     state: Mutex<BorrowState>,
     data: UnsafeCell<MaybeUninit<T>>
 }
 
+#[derive(Debug)]
 struct BorrowState {
     strong: usize,
     mut_toggles: u64,
@@ -32,6 +34,7 @@ impl BorrowState {
     }
 
     pub fn drain_immutable(&mut self) {
+        debug_assert_eq!(self.is_mut(), false);
         while let Some(next) = self.stack.last() {
             match next {
                 BorrowWaker::Skip => {
@@ -47,6 +50,7 @@ impl BorrowState {
     }
 
     pub fn drain_empty(&mut self) {
+        debug_assert_eq!(self.is_mut(), false);
         while let Some(next) = self.stack.last() {
             match next {
                 BorrowWaker::Skip => {
@@ -69,6 +73,7 @@ impl BorrowState {
     }
 }
 
+#[derive(Debug)]
 enum BorrowWaker {
     Skip,
     Ref(Waker),
@@ -84,14 +89,10 @@ impl BorrowWaker {
         }
     }
 
-    pub fn poll(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        use std::task::Poll;
+    pub fn set(&mut self, cx: &mut std::task::Context<'_>) {
         match self {
-            BorrowWaker::Skip => Poll::Ready(()),
-            BorrowWaker::Ref(waker) | BorrowWaker::Mut(waker) => {
-                *waker = cx.waker().clone();
-                Poll::Pending
-            },
+            BorrowWaker::Skip => (),
+            BorrowWaker::Ref(waker) | BorrowWaker::Mut(waker) => *waker = cx.waker().clone(),
         }
     }
 }
@@ -102,11 +103,30 @@ struct SharedPtr<T> {
     inner: NonNull<BorrowInner<T>>
 }
 
+unsafe impl<T> Send for SharedPtr<T> {}
+
+unsafe impl<T> Sync for SharedPtr<T> {}
+
+impl<T> Debug for SharedPtr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::sync::PoisonError;
+        let inner = self.inner();
+        let state = inner.state.lock().unwrap_or_else(PoisonError::into_inner);
+        f.debug_struct("SharedPtr")
+            .field("weak", &inner.weak.load(Ordering::Relaxed))
+            .field("strong", &state.strong)
+            .field("mut_toggles", &state.mut_toggles)
+            .field("stack", &state.stack)
+            .field("data", &inner.data)
+            .finish()
+    }
+}
+
 impl<T> SharedPtr<T> {
     pub fn new(data: T) -> Self {
         SharedPtr {
             inner: unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(BorrowInner {
-                weak: 0.into(),
+                weak: 1.into(),
                 state: Mutex::new(BorrowState {
                     strong: 1,
                     mut_toggles: 0,
@@ -119,10 +139,6 @@ impl<T> SharedPtr<T> {
 
     pub fn inner(&self) -> &BorrowInner<T> {
         unsafe { self.inner.as_ref() }
-    }
-
-    pub unsafe fn inner_mut(&mut self) -> &mut BorrowInner<T> {
-        unsafe { self.inner.as_mut() }
     }
 
     pub unsafe fn get_ref(&self) -> &T {
@@ -149,6 +165,7 @@ impl<T> Drop for SharedPtr<T> {
     }
 }
 
+#[derive(Debug)]
 struct BorrowPtr<T> {
     shared: SharedPtr<T>
 }
@@ -195,6 +212,7 @@ impl Index for usize {
     }
 }
 
+#[derive(Debug)]
 struct First;
 
 impl Index for First {
@@ -203,6 +221,7 @@ impl Index for First {
     }
 }
 
+#[derive(Debug)]
 struct FuturePtr<T, I: Index> {
     shared: Option<SharedPtr<T>>,
     index: I
@@ -221,7 +240,7 @@ impl<T, I: Index> Future for FuturePtr<T, I> {
         use std::task::Poll;
         let mut state = self.shared.as_ref().unwrap().inner().state.lock().unwrap();
         if let Some(waker) = state.stack.get_mut(self.index.get()) {
-            waker.poll(cx);
+            waker.set(cx);
             return Poll::Pending
         };
         drop(state);
@@ -254,6 +273,7 @@ impl<T, I: Index> Drop for FuturePtr<T, I> {
 
 // MARK: Smart Pointers
 
+#[derive(Debug)]
 pub struct ShareBox<T> {
     ptr: SharedPtr<T>,
     _variance: PhantomData<*const T>
@@ -314,13 +334,13 @@ impl<T> ShareBox<T> {
         )
     }
 
-    pub fn spawn_ref(self, f: impl FnOnce(Ref<T>)) -> RefShare<T> {
+    pub fn spawn_ref<U>(self, f: impl FnOnce(Ref<T>) -> U) -> RefShare<T> {
         let (fut, ptr) = self.share_ref();
         f(ptr);
         fut
     }
 
-    pub fn spawn_mut(self, f: impl FnOnce(RefMut<T>)) -> RefMutShare<T> {
+    pub fn spawn_mut<U>(self, f: impl FnOnce(RefMut<T>) -> U) -> RefMutShare<T> {
         let (fut, ptr) = self.share_mut();
         f(ptr);
         fut
@@ -345,7 +365,7 @@ impl<T> ShareBox<T> {
     }
 
     pub fn into_inner(self) -> T {
-        unsafe { self.into_shared().inner_mut().data.get_mut().assume_init_read() }
+        unsafe { self.into_shared().inner().data.get().as_mut().unwrap_unchecked().assume_init_read() }
     }
 }
 
@@ -371,10 +391,11 @@ impl<T: Clone> Clone for ShareBox<T> {
 
 impl<T> Drop for ShareBox<T> {
     fn drop(&mut self) {
-        unsafe { self.ptr.inner_mut().data.get_mut().assume_init_drop() }
+        unsafe { self.ptr.inner().data.get().as_mut().unwrap_unchecked().assume_init_drop() }
     }
 }
 
+#[derive(Debug)]
 pub struct Weak<T> {
     ptr: SharedPtr<T>,
     _variance: PhantomData<*const T>,
@@ -411,6 +432,7 @@ impl<T> Clone for Weak<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct Ref<T> {
     ptr: BorrowPtr<T>,
     _variance: PhantomData<*const T>
@@ -451,6 +473,7 @@ impl<T> Clone for Ref<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct RefMut<T> {
     ptr: BorrowPtr<T>,
     _variance: PhantomData<*mut T>
@@ -470,12 +493,6 @@ impl<T> RefMut<T> {
             ptr: self.ptr,
             _variance: PhantomData,
         }
-    }
-
-    fn into_shared(self) -> SharedPtr<T> {
-        let ptr = SharedPtr { inner: self.ptr.inner };
-        std::mem::forget(self);
-        ptr
     }
 
     pub fn forward_ref(self) -> (RefForward<T>, Ref<T>) {
@@ -519,13 +536,13 @@ impl<T> RefMut<T> {
         )
     }
 
-    pub fn cleave_ref(self, f: impl FnOnce(Ref<T>)) -> RefForward<T> {
+    pub fn cleave_ref<U>(self, f: impl FnOnce(Ref<T>) -> U) -> RefForward<T> {
         let (fut, ptr) = self.forward_ref();
         f(ptr);
         fut
     }
 
-    pub fn cleave_mut(self, f: impl FnOnce(RefMut<T>)) -> RefMutForward<T> {
+    pub fn cleave_mut<U>(self, f: impl FnOnce(RefMut<T>) -> U) -> RefMutForward<T> {
         let (fut, ptr) = self.forward_mut();
         f(ptr);
         fut
@@ -548,6 +565,7 @@ impl<T> DerefMut for RefMut<T> {
 
 // MARK: Futures
 
+#[derive(Debug)]
 pub struct RefShare<T> {
     ptr: FuturePtr<T, First>,
     _variance: PhantomData<*const T>
@@ -603,6 +621,7 @@ impl<T> FusedFuture for RefShare<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct RefMutShare<T> {
     ptr: FuturePtr<T, First>,
     _variance: PhantomData<*const T>
@@ -638,6 +657,7 @@ impl<T> From<RefShare<T>> for RefMutShare<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct RefForward<T> {
     ptr: FuturePtr<T, usize>,
     _variance: PhantomData<*mut T>
@@ -708,6 +728,7 @@ impl<T> FusedFuture for RefForward<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct RefMutForward<T> {
     ptr: FuturePtr<T, usize>,
     _variance: PhantomData<*mut T>
@@ -731,6 +752,7 @@ impl<T> RefMutForward<T> {
         } else {
             state.mut_toggles += 1; // now immutable
         }
+        state.shake();
         drop(state);
         RefBlocking { ptr: self.ptr, _variance: PhantomData }
     }
@@ -756,6 +778,7 @@ impl<T> From<RefForward<T>> for RefMutForward<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct RefBlocking<T> {
     ptr: FuturePtr<T, usize>,
     _variance: PhantomData<*const T>
@@ -776,5 +799,125 @@ impl<T> Future for RefBlocking<T> {
 impl<T> FusedFuture for RefBlocking<T> {
     fn is_terminated(&self) -> bool {
         self.ptr.is_terminated()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::Mutex;
+
+    use crate::ShareBox;
+
+    #[tokio::test]
+    async fn vibe_check() {
+        use tokio::{task::spawn, time::{sleep, Duration}};
+        let mut example = ShareBox::new(Mutex::new(0));
+        *example.get_mut().unwrap() += 1;
+        let mut example = example
+            // borrow mut
+            .spawn_mut(|mut example| spawn(async move {
+                *example.get_mut().unwrap() += 1;
+            }))
+            .await
+            // borrow mut
+            .spawn_mut(|example| spawn(async move {
+                *example
+                    // forwarding borrow mut
+                    .cleave_mut(|mut example| spawn(async move {
+                        *example.get_mut().unwrap() += 1;
+                    }))
+                    .await
+                    // forwarding borrow
+                    .cleave_ref(|example| spawn(async move {
+                        let a = example.clone();
+                        let b = example.clone();
+                        let c = example;
+                        spawn(async move {
+                            sleep(Duration::from_secs(3)).await;
+                            *a.lock().unwrap() += 1;
+                        });
+                        spawn(async move {
+                            sleep(Duration::from_secs(2)).await;
+                            *b.lock().unwrap() += 1;
+                        });
+                        spawn(async move {
+                            sleep(Duration::from_secs(1)).await;
+                            *c.lock().unwrap() += 1;
+                        });
+                    }))
+                    .await
+                    // reaquisition
+                    .get_mut().unwrap() += 1;
+            }))
+            .await
+            // borrow mut
+            .spawn_ref(|example| spawn(async move {
+                let a = example.clone();
+                let b = example.clone();
+                let c = example;
+                spawn(async move {
+                    sleep(Duration::from_secs(3)).await;
+                    *a.lock().unwrap() += 1;
+                });
+                spawn(async move {
+                    sleep(Duration::from_secs(2)).await;
+                    *b.lock().unwrap() += 1;
+                });
+                spawn(async move {
+                    sleep(Duration::from_secs(1)).await;
+                    *c.lock().unwrap() += 1;
+                });
+            }))
+            .await
+            // borrow
+            .spawn_mut(|mut example| spawn(async move {
+                *example.get_mut().unwrap() += 1;
+            }))
+            .await;
+        // reaquisition
+        *example.get_mut().unwrap() += 1;
+        assert_eq!(12, example.into_inner().into_inner().unwrap());
+    }
+
+    #[test]
+    fn new_drop() {
+        let example = ShareBox::new(());
+        let visitor = example.ptr.clone();
+        println!("new: {:?}", &visitor);
+        drop(example);
+        println!("drop: {:?}", &visitor);
+    }
+
+    #[test]
+    fn new_take() {
+        let example = ShareBox::new(());
+        let visitor = example.ptr.clone();
+        println!("new: {:?}", &visitor);
+        example.into_inner();
+        println!("into: {:?}", &visitor);
+    }
+
+    #[test]
+    fn new_into_ref() {
+        let example = ShareBox::new(());
+        let visitor = example.ptr.clone();
+        println!("new: {:?}", &visitor);
+        drop(example.into_ref());
+        println!("ref: {:?}", &visitor);
+    }
+
+    #[tokio::test]
+    async fn lil_test() {
+        let example = ShareBox::new(());
+        let visitor = example.ptr.clone();
+        println!("new: {:?}", &visitor);
+        let (fut, rm) = example.share_mut();
+        println!("shared: {:?}", &visitor);
+        drop(rm);
+        println!("dropped: {:?}", &visitor);
+        let example = fut.await;
+        println!("awaited: {:?}", &visitor);
+        example.into_inner();
+        println!("into: {:?}", &visitor);
     }
 }
