@@ -1,6 +1,6 @@
 use std::{ops::{Deref, DerefMut}, pin::Pin, future::Future};
 
-use crate::{Mut, Ref};
+use crate::{RefMut, Ref};
 
 // Access
 
@@ -35,7 +35,7 @@ trait UnsharedEntry {
     type Elem;
     fn as_ref(&self) -> &Self::Elem;
     fn as_mut(&mut self) -> Self::Modify<&mut Self::Elem>;
-    fn finalize(self) -> Pin<Mut<Self::Elem>>;
+    fn finalize(self) -> Pin<RefMut<Self::Elem>>;
 }
 
 trait SharableEntry: UnsharedEntry {
@@ -44,7 +44,7 @@ trait SharableEntry: UnsharedEntry {
 }
 
 trait MutSharableEntry: SharableEntry {
-    fn share_mut(self) -> (Self::Shared, Self::Modify<Mut<Self::Elem>>);
+    fn share_mut(self) -> (Self::Shared, Self::Modify<RefMut<Self::Elem>>);
 }
 
 trait SharedEntry: Future<Output = Self::Unshared> {
