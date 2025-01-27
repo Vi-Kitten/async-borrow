@@ -1,99 +1,19 @@
-use std::{cell::UnsafeCell, fmt::Debug, future::Future, marker::PhantomData, mem::MaybeUninit, ops::{Deref, DerefMut}, pin::Pin, ptr::NonNull, sync::{atomic::{AtomicUsize, Ordering}, Mutex}, task::Waker, usize};
+use std::{cell::UnsafeCell, future::Future, marker::PhantomData, mem::MaybeUninit, ops::{Deref, DerefMut}, pin::Pin, ptr::NonNull, sync::{atomic::{AtomicUsize, Ordering}, Mutex}, usize};
 
-use futures::{future::FusedFuture, FutureExt};
+use futures::future::FusedFuture;
 
 mod graph;
 pub mod scope;
 
+use graph::Graph;
+
 // MARK: Inner
 
-#[derive(Debug)]
+#[repr(align(4))] // aligned manually for 2 bits of extra space.
 struct BorrowInner<T> {
     weak: AtomicUsize,
-    state: Mutex<BorrowState>,
+    graph: Mutex<Graph>,
     data: UnsafeCell<MaybeUninit<T>>
-}
-
-#[derive(Debug)]
-struct BorrowState {
-    strong: usize,
-    mut_toggles: u64,
-    stack: Vec<BorrowWaker>,
-}
-
-impl BorrowState {
-    pub fn is_mut(&self) -> bool {
-        self.mut_toggles & 1 == 0
-    }
-
-    pub fn shake(&mut self) {
-        if !self.is_mut() {
-            self.drain_immutable();
-        }
-    }
-
-    pub fn drain_immutable(&mut self) {
-        debug_assert_eq!(self.is_mut(), false);
-        while let Some(next) = self.stack.last() {
-            match next {
-                BorrowWaker::Skip => {
-                    self.stack.pop();
-                },
-                BorrowWaker::Ref(_) => {
-                    self.strong += 1;
-                    unsafe { self.stack.pop().unwrap_unchecked() }.wake();
-                },
-                BorrowWaker::Mut(_) => return,
-            }
-        }
-    }
-
-    pub fn drain_empty(&mut self) {
-        debug_assert_eq!(self.is_mut(), false);
-        while let Some(next) = self.stack.last() {
-            match next {
-                BorrowWaker::Skip => {
-                    self.stack.pop();
-                },
-                BorrowWaker::Ref(_) => {
-                    self.strong += 1;
-                    unsafe { self.stack.pop().unwrap_unchecked() }.wake();
-                    self.drain_immutable();
-                },
-                BorrowWaker::Mut(_) => {
-                    self.strong += 1;
-                    self.mut_toggles += 1; // now mutable
-                    unsafe { self.stack.pop().unwrap_unchecked() }.wake();
-                    return
-                },
-            }
-        }
-
-    }
-}
-
-#[derive(Debug)]
-enum BorrowWaker {
-    Skip,
-    Ref(Waker),
-    Mut(Waker),
-}
-
-impl BorrowWaker {
-    pub fn wake(self) {
-        match self {
-            BorrowWaker::Skip => (),
-            BorrowWaker::Ref(waker) => waker.wake(),
-            BorrowWaker::Mut(waker) => waker.wake(),
-        }
-    }
-
-    pub fn set(&mut self, cx: &mut std::task::Context<'_>) {
-        match self {
-            BorrowWaker::Skip => (),
-            BorrowWaker::Ref(waker) | BorrowWaker::Mut(waker) => *waker = cx.waker().clone(),
-        }
-    }
 }
 
 // MARK: Raw Pointers
@@ -106,31 +26,12 @@ unsafe impl<T> Send for SharedPtr<T> {}
 
 unsafe impl<T> Sync for SharedPtr<T> {}
 
-impl<T> Debug for SharedPtr<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use std::sync::PoisonError;
-        let inner = self.inner();
-        let state = inner.state.lock().unwrap_or_else(PoisonError::into_inner);
-        f.debug_struct("SharedPtr")
-            .field("weak", &inner.weak.load(Ordering::Relaxed))
-            .field("strong", &state.strong)
-            .field("mut_toggles", &state.mut_toggles)
-            .field("stack", &state.stack)
-            .field("data", &inner.data)
-            .finish()
-    }
-}
-
 impl<T> SharedPtr<T> {
     pub fn new(data: T) -> Self {
         SharedPtr {
             inner: unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(BorrowInner {
                 weak: 1.into(),
-                state: Mutex::new(BorrowState {
-                    strong: 1,
-                    mut_toggles: 0,
-                    stack: Vec::new(),
-                }),
+                graph: Mutex::new(Graph::new()),
                 data: UnsafeCell::new(MaybeUninit::new(data)),
             }))) }
         }
@@ -164,9 +65,9 @@ impl<T> Drop for SharedPtr<T> {
     }
 }
 
-#[derive(Debug)]
 struct BorrowPtr<T> {
-    shared: SharedPtr<T>
+    shared: SharedPtr<T>,
+    index: usize,
 }
 
 impl<T> Deref for BorrowPtr<T> {
@@ -183,20 +84,24 @@ impl<T> DerefMut for BorrowPtr<T> {
     }
 }
 
+impl<T> Clone for BorrowPtr<T> {
+    fn clone(&self) -> Self {
+        let mut graph = self.inner().graph.lock().unwrap();
+        unsafe { graph.track_borrow_unchecked(self.index) };
+        BorrowPtr {
+            shared: self.shared.clone(),
+            index: self.index
+        }
+    }
+}
+
 impl<T> Drop for BorrowPtr<T> {
     fn drop(&mut self) {
-        let Ok(mut state) = self.inner().state.lock() else { return }; // TODO: handle poisoning
-        state.strong -= 1;
-        if state.is_mut() {
-            state.mut_toggles += 1; // now immutable
-            state.drain_empty();
-        } else if state.strong == 0 {
-            state.drain_empty();
-        }
-        if state.strong == 0 {
-            state.mut_toggles += 1; // now mutable
-            drop(state);
-            unsafe { self.inner().data.get().as_mut().unwrap_unchecked().assume_init_drop() };
+        let Ok(mut graph) = self.inner().graph.lock() else { return }; // TODO: handle poisoning
+        unsafe {
+            if graph.untrack_borrow_unchecked(self.index) {
+                self.inner().data.get().as_mut().unwrap_unchecked().assume_init_drop();
+            }
         }
     }
 }
@@ -211,7 +116,6 @@ impl Index for usize {
     }
 }
 
-#[derive(Debug)]
 struct First;
 
 impl Index for First {
@@ -220,30 +124,35 @@ impl Index for First {
     }
 }
 
-#[derive(Debug)]
 struct FuturePtr<T, I: Index> {
     shared: Option<SharedPtr<T>>,
     index: I
 }
 
 impl<T, I: Index> FuturePtr<T, I> {
-    pub fn polymorphic(mut self) -> FuturePtr<T, usize> {
+    pub fn generalise(mut self) -> FuturePtr<T, usize> {
         FuturePtr { shared: self.shared.take(), index: self.index.get() }
+    }
+
+    pub fn poll_shared(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<SharedPtr<T>> {
+        Pin::new(self).poll(cx).map(|(_, shared)| shared)
+    }
+
+    pub fn poll_borrow(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<BorrowPtr<T>> {
+        Pin::new(self).poll(cx).map(|(index, shared)|
+            BorrowPtr { shared, index }
+        )
     }
 } 
 
 impl<T, I: Index> Future for FuturePtr<T, I> {
-    type Output = SharedPtr<T>;
+    type Output = (usize, SharedPtr<T>);
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-        use std::task::Poll;
-        let mut state = self.shared.as_ref().unwrap().inner().state.lock().unwrap();
-        if let Some(waker) = state.stack.get_mut(self.index.get()) {
-            waker.set(cx);
-            return Poll::Pending
-        };
-        drop(state);
-        Poll::Ready(unsafe { self.shared.take().unwrap_unchecked() })
+        let mut graph = self.shared.as_ref().unwrap().inner().graph.lock().unwrap();
+        let poll = unsafe { graph.poll_unchecked(self.index.get(), cx) };
+        drop(graph); // release mutex
+        poll.map(|index| (index, unsafe { self.shared.take().unwrap_unchecked() }))
     }
 }
 
@@ -255,24 +164,17 @@ impl<T, I: Index> FusedFuture for FuturePtr<T, I> {
 
 impl<T, I: Index> Drop for FuturePtr<T, I> {
     fn drop(&mut self) {
-        let Some(shared) = self.shared.take() else { return };
-        let Ok(mut state) = shared.inner().state.lock() else { return }; // TODO: handle poisoning
-        if let Some(waker) = state.stack.get_mut(self.index.get()) {
-            *waker = BorrowWaker::Skip;
-            drop(state);
-            drop(shared)
-        } else {
-            drop(state);
-            drop(BorrowPtr {
-                shared,
-            })
+        let Some(shared) = self.shared.as_ref() else { return };
+        let mut graph = shared.inner().graph.lock().unwrap();
+        if unsafe { !graph.close_future_unchecked(self.index.get()) } {
+            drop(graph); // release mutex
+            unsafe { drop(self.shared.take().unwrap_unchecked()) }
         }
     }
 }
 
 // MARK: Smart Pointers
 
-#[derive(Debug)]
 pub struct ShareBox<T> {
     ptr: SharedPtr<T>,
     _variance: PhantomData<*const T>
@@ -297,37 +199,46 @@ impl<T> ShareBox<T> {
     }
 
     pub fn share_ref(self) -> (RefShare<T>, Ref<T>) {
-        let mut state = self.ptr.inner().state.lock().unwrap();
-        state.mut_toggles += 1; // now immutable
-        state.stack.push(BorrowWaker::Mut(futures::task::noop_waker()));
-        drop(state);
-        let ptr = self.into_shared();
-        let shared = ptr.clone();
+        let mut graph = self.ptr.inner().graph.lock().unwrap();
+        debug_assert_eq!(graph.share(), 0, r#"
+            Graph should only have one root and it must be the last to be freed,
+            hence it should be at the start of the free list / stack
+            "#
+        );
+        let index = 0;
+        drop(graph);
+        let shared = self.into_shared();
+        let ptr = shared.clone();
         (
             RefShare {
                 ptr: FuturePtr { shared: Some(ptr), index: First },
                 _variance: PhantomData,
             },
             Ref {
-                ptr: BorrowPtr { shared },
+                ptr: BorrowPtr { shared, index },
                 _variance: PhantomData,
             }
         )
     }
 
     pub fn share_mut(self) -> (RefMutShare<T>, RefMut<T>) {
-        let mut state = self.ptr.inner().state.lock().unwrap();
-        state.stack.push(BorrowWaker::Mut(futures::task::noop_waker()));
-        drop(state);
-        let ptr = self.into_shared();
-        let shared = ptr.clone();
+        let mut graph = self.ptr.inner().graph.lock().unwrap();
+        debug_assert_eq!(graph.share(), 0, r#"
+            Graph should only have one root and it must be the last to be freed,
+            hence it should be at the start of the free list / stack
+            "#
+        );
+        let index = 0;
+        drop(graph);
+        let shared = self.into_shared();
+        let ptr = shared.clone();
         (
             RefMutShare {
                 ptr: FuturePtr { shared: Some(ptr), index: First },
                 _variance: PhantomData,
             },
             RefMut {
-                ptr: BorrowPtr { shared },
+                ptr: BorrowPtr { shared, index },
                 _variance: PhantomData,
             }
         )
@@ -346,19 +257,20 @@ impl<T> ShareBox<T> {
     }
 
     pub fn into_ref(self) -> Ref<T> {
-        self.ptr.inner().state.lock().unwrap().mut_toggles += 1; // now immutable
+        let index = graph::END;
         let shared = self.into_shared();
         Ref {
-            ptr: BorrowPtr { shared },
+            ptr: BorrowPtr { shared, index },
             _variance: PhantomData
         }
 
     }
 
     pub fn into_mut(self) -> RefMut<T> {
+        let index = graph::END;
         let shared = self.into_shared();
         RefMut {
-            ptr: BorrowPtr { shared },
+            ptr: BorrowPtr { shared, index },
             _variance: PhantomData
         }
     }
@@ -394,11 +306,12 @@ impl<T> Drop for ShareBox<T> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct Weak<T> {
-    ptr: SharedPtr<T>,
+    shared: SharedPtr<T>,
     _variance: PhantomData<*const T>,
-    mut_toggles: u64,
+    index: usize,
+    version: u64,
 }
 
 unsafe impl<T: Send> Send for Weak<T> {}
@@ -407,31 +320,16 @@ unsafe impl<T: Send> Sync for Weak<T> {}
 
 impl<T> Weak<T> {
     pub fn upgrade(self) -> Option<Ref<T>> {
-        let mut state = self.ptr.inner().state.lock().unwrap();
-        if state.mut_toggles == self.mut_toggles {
-            state.strong += 1;
-            drop(state);
-            Some(Ref {
-                ptr: BorrowPtr { shared: self.ptr },
-                _variance: PhantomData,
+        let mut graph = self.shared.inner().graph.lock().unwrap();
+        unsafe { graph.try_upgrade_weak_unchecked(self.index, self.version) }
+            .then_some(drop(graph))
+            .map(|_| Ref {
+                ptr: BorrowPtr { shared: self.shared, index: self.index },
+                _variance: PhantomData
             })
-        } else {
-            None
-        }
     }
 }
 
-impl<T> Clone for Weak<T> {
-    fn clone(&self) -> Self {
-        Weak {
-            ptr: self.ptr.clone(),
-            _variance: self._variance,
-            mut_toggles: self.mut_toggles
-        }
-    }
-}
-
-#[derive(Debug)]
 pub struct Ref<T> {
     ptr: BorrowPtr<T>,
     _variance: PhantomData<*const T>
@@ -443,11 +341,13 @@ unsafe impl<T: Send> Sync for Ref<T> {}
 
 impl<T> Ref<T> {
     pub fn downgrade(&self) -> Weak<T> {
-        let mut_toggles = self.ptr.inner().state.lock().unwrap().mut_toggles;
+        let mut graph = self.ptr.inner().graph.lock().unwrap();
+        let version = unsafe { graph.track_weak_unchecked(self.ptr.index) };
         Weak {
-            ptr: self.ptr.clone(),
+            shared: self.ptr.shared.clone(),
             _variance: PhantomData,
-            mut_toggles,
+            index: self.ptr.index,
+            version,
         }
     }
 }
@@ -462,17 +362,13 @@ impl<T> Deref for Ref<T> {
 
 impl<T> Clone for Ref<T> {
     fn clone(&self) -> Self {
-        let strong = &mut self.ptr.shared.inner().state.lock().unwrap().strong;
-        let shared = self.ptr.clone();
-        *strong += 1;
         Ref {
-            ptr: BorrowPtr { shared },
+            ptr: self.ptr.clone(),
             _variance: PhantomData
         }
     }
 }
 
-#[derive(Debug)]
 pub struct RefMut<T> {
     ptr: BorrowPtr<T>,
     _variance: PhantomData<*mut T>
@@ -484,52 +380,49 @@ unsafe impl<T: Sync> Sync for RefMut<T> {}
 
 impl<T> RefMut<T> {
     pub fn into_ref(self) -> Ref<T> {
-        let mut state = self.ptr.inner().state.lock().unwrap();
-        state.mut_toggles += 1; // now immutable
-        state.drain_immutable();
-        drop(state);
+        let RefMut {
+            ptr,
+            _variance
+        } = self;
         Ref {
-            ptr: self.ptr,
+            ptr,
             _variance: PhantomData,
         }
     }
 
     pub fn forward_ref(self) -> (RefForward<T>, Ref<T>) {
-        let mut state = self.ptr.inner().state.lock().unwrap();
-        state.mut_toggles += 1; // now immutable
-        let n = state.stack.len();
-        state.stack.push(BorrowWaker::Mut(futures::task::noop_waker()));
-        drop(state);
-        let ptr = SharedPtr { inner: self.ptr.inner };
-        std::mem::forget(self);
-        let shared = ptr.clone();
+        let mut graph = self.ptr.inner().graph.lock().unwrap();
+        let index = graph.forward(self.ptr.index);
+        drop(graph);
+        let shared = SharedPtr { inner: self.ptr.inner };
+        let ptr = shared.clone();
+        std::mem::forget(self.ptr);
         (
             RefForward {
-                ptr: FuturePtr { shared: Some(ptr), index: n },
+                ptr: FuturePtr { shared: Some(ptr), index },
                 _variance: PhantomData,
             },
             Ref {
-                ptr: BorrowPtr { shared },
+                ptr: BorrowPtr { shared, index },
                 _variance: PhantomData,
             }
         )
     }
 
     pub fn forward_mut(self) -> (RefMutForward<T>, RefMut<T>) {
-        let mut state = self.ptr.inner().state.lock().unwrap();
-        let n = state.stack.len();
-        state.stack.push(BorrowWaker::Mut(futures::task::noop_waker()));
-        drop(state);
-        let ptr = SharedPtr { inner: self.ptr.inner };
-        std::mem::forget(self);
-        let shared = ptr.clone();
+        let mut graph = self.ptr.inner().graph.lock().unwrap();
+        let index = graph.forward(self.ptr.index);
+        drop(graph);
+        let shared = SharedPtr { inner: self.ptr.inner };
+        let ptr = shared.clone();
+        std::mem::forget(self.ptr);
         (
             RefMutForward {
-                ptr: FuturePtr { shared: Some(ptr), index: n },
+                ptr: FuturePtr { shared: Some(ptr), index },
                 _variance: PhantomData,
             },
             RefMut {
-                ptr: BorrowPtr { shared },
+                ptr: BorrowPtr { shared, index },
                 _variance: PhantomData,
             }
         )
@@ -564,7 +457,6 @@ impl<T> DerefMut for RefMut<T> {
 
 // MARK: Futures
 
-#[derive(Debug)]
 pub struct RefShare<T> {
     ptr: FuturePtr<T, First>,
     _variance: PhantomData<*const T>
@@ -580,29 +472,19 @@ impl<T> RefShare<T> {
     }
 
     pub fn as_ref(&self) -> Ref<T> {
-        let mut state = self.ptr.shared.as_ref().unwrap().inner().state.lock().unwrap();
-        let shared = unsafe { self.ptr.shared.as_ref().unwrap_unchecked() }.clone();
-        if let Some(_) = state.stack.get_mut(self.ptr.index.get()) {
-            state.strong += 1;
-            return Ref {
-                ptr: BorrowPtr { shared },
-                _variance: PhantomData,
-            }
-        };
-        state.stack.push(BorrowWaker::Mut(futures::task::noop_waker()));
-        state.mut_toggles += 1; // now immutable
-        return Ref {
-            ptr: BorrowPtr { shared },
+        let shared = self.ptr.shared.as_ref().unwrap().clone();
+        let mut graph = shared.inner().graph.lock().unwrap();
+        let index = self.ptr.index.get();
+        unsafe { graph.track_borrow_unchecked(index) };
+        drop(graph);
+        Ref {
+            ptr: BorrowPtr { shared, index },
             _variance: PhantomData,
         }
     }
 
-    pub fn into_ref(self) -> Ref<T> {
-        self.into_forward().into_ref()
-    }
-
-    pub fn into_forward(self) -> RefForward<T> {
-        RefForward { ptr: self.ptr.polymorphic(), _variance: PhantomData }
+    pub fn generalise(self) -> RefForward<T> {
+        RefForward { ptr: self.ptr.generalise(), _variance: PhantomData }
     }
 }
 
@@ -610,7 +492,7 @@ impl<T> Future for RefShare<T> {
     type Output = ShareBox<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-        self.ptr.poll_unpin(cx).map(|ptr| ShareBox { ptr, _variance: PhantomData })
+        self.ptr.poll_shared(cx).map(|ptr| ShareBox { ptr, _variance: PhantomData })
     }
 }
 
@@ -620,7 +502,6 @@ impl<T> FusedFuture for RefShare<T> {
     }
 }
 
-#[derive(Debug)]
 pub struct RefMutShare<T> {
     ptr: FuturePtr<T, First>,
     _variance: PhantomData<*const T>
@@ -631,8 +512,8 @@ unsafe impl<T: Send> Send for RefMutShare<T> {}
 unsafe impl<T: Sync> Sync for RefMutShare<T> {}
 
 impl<T> RefMutShare<T> {
-    pub fn into_forward(self) -> RefMutForward<T> {
-        RefMutForward { ptr: self.ptr.polymorphic(), _variance: PhantomData }
+    pub fn generalise(self) -> RefMutForward<T> {
+        RefMutForward { ptr: self.ptr.generalise(), _variance: PhantomData }
     }
 }
 
@@ -640,7 +521,7 @@ impl<T> Future for RefMutShare<T> {
     type Output = ShareBox<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-        self.ptr.poll_unpin(cx).map(|ptr| ShareBox { ptr, _variance: PhantomData })
+        self.ptr.poll_shared(cx).map(|ptr| ShareBox { ptr, _variance: PhantomData })
     }
 }
 
@@ -656,7 +537,6 @@ impl<T> From<RefShare<T>> for RefMutShare<T> {
     }
 }
 
-#[derive(Debug)]
 pub struct RefForward<T> {
     ptr: FuturePtr<T, usize>,
     _variance: PhantomData<*mut T>
@@ -671,43 +551,14 @@ impl<T> RefForward<T> {
         unsafe { self.ptr.shared.as_ref().unwrap().get_ref() }
     }
 
-    pub fn create_ref(&mut self) -> Ref<T> {
-        let mut state = self.ptr.shared.as_ref().unwrap().inner().state.lock().unwrap();
-        let shared = unsafe { self.ptr.shared.as_ref().unwrap_unchecked() }.clone();
-        if let Some(_) = state.stack.get_mut(self.ptr.index.get()) {
-            state.strong += 1;
-            return Ref {
-                ptr: BorrowPtr { shared },
-                _variance: PhantomData,
-            }
-        };
-        let n = state.stack.len();
-        state.stack.push(BorrowWaker::Mut(futures::task::noop_waker()));
-        state.mut_toggles += 1; // now immutable
-        drop(state);
-        self.ptr.index = n;
-        return Ref {
-            ptr: BorrowPtr { shared },
-            _variance: PhantomData,
-        }
-    }
-
-    pub fn into_ref(mut self) -> Ref<T> {
-        let shared = self.ptr.shared.take().unwrap();
-        let mut state = shared.inner().state.lock().unwrap();
-        if let Some(waker) = state.stack.get_mut(self.ptr.index.get()) {
-            *waker = BorrowWaker::Skip;
-            state.strong += 1;
-            drop(state);
-            return Ref {
-                ptr: BorrowPtr { shared },
-                _variance: PhantomData,
-            }
-        };
-        state.mut_toggles += 1; // now immutable
-        drop(state);
-        return Ref {
-            ptr: BorrowPtr { shared },
+    pub fn as_ref(&mut self) -> Ref<T> {
+        let shared = self.ptr.shared.as_ref().unwrap().clone();
+        let mut graph = shared.inner().graph.lock().unwrap();
+        let index = self.ptr.index.get();
+        unsafe { graph.track_borrow_unchecked(index) };
+        drop(graph);
+        Ref {
+            ptr: BorrowPtr { shared, index },
             _variance: PhantomData,
         }
     }
@@ -717,7 +568,7 @@ impl<T> Future for RefForward<T> {
     type Output = RefMut<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-        self.ptr.poll_unpin(cx).map(|shared: SharedPtr<T>| RefMut { ptr: BorrowPtr { shared }, _variance: PhantomData })
+        self.ptr.poll_borrow(cx).map(|ptr| RefMut { ptr, _variance: PhantomData })
     }
 }
 
@@ -727,7 +578,6 @@ impl<T> FusedFuture for RefForward<T> {
     }
 }
 
-#[derive(Debug)]
 pub struct RefMutForward<T> {
     ptr: FuturePtr<T, usize>,
     _variance: PhantomData<*mut T>
@@ -737,31 +587,11 @@ unsafe impl<T: Send> Send for RefMutForward<T> {}
 
 unsafe impl<T: Sync> Sync for RefMutForward<T> {}
 
-impl<T> RefMutForward<T> {
-    pub fn into_ref_blocking(self) -> RefBlocking<T> {
-        let mut state = self.ptr.shared.as_ref().unwrap().inner().state.lock().unwrap();
-        if let Some(waker) = state.stack.get_mut(self.ptr.index.get()) {
-            match std::mem::replace(waker, BorrowWaker::Skip) {
-                BorrowWaker::Skip => (),
-                BorrowWaker::Ref(_) => unreachable!(),
-                BorrowWaker::Mut(inner_waker) => {
-                    *waker = BorrowWaker::Ref(inner_waker)
-                },
-            };
-        } else {
-            state.mut_toggles += 1; // now immutable
-        }
-        state.shake();
-        drop(state);
-        RefBlocking { ptr: self.ptr, _variance: PhantomData }
-    }
-}
-
 impl<T> Future for RefMutForward<T> {
     type Output = RefMut<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-        self.ptr.poll_unpin(cx).map(|shared: SharedPtr<T>| RefMut { ptr: BorrowPtr { shared }, _variance: PhantomData })
+        self.ptr.poll_borrow(cx).map(|ptr| RefMut { ptr, _variance: PhantomData })
     }
 }
 
@@ -777,29 +607,7 @@ impl<T> From<RefForward<T>> for RefMutForward<T> {
     }
 }
 
-#[derive(Debug)]
-pub struct RefBlocking<T> {
-    ptr: FuturePtr<T, usize>,
-    _variance: PhantomData<*const T>
-}
-
-unsafe impl<T: Sync> Send for RefBlocking<T> {}
-
-unsafe impl<T: Sync> Sync for RefBlocking<T> {}
-
-impl<T> Future for RefBlocking<T> {
-    type Output = Ref<T>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-        self.ptr.poll_unpin(cx).map(|shared: SharedPtr<T>| Ref { ptr: BorrowPtr { shared }, _variance: PhantomData })
-    }
-}
-
-impl<T> FusedFuture for RefBlocking<T> {
-    fn is_terminated(&self) -> bool {
-        self.ptr.is_terminated()
-    }
-}
+// MARK: Tests
 
 #[cfg(test)]
 mod test {
@@ -832,15 +640,15 @@ mod test {
                         let b = example.clone();
                         let c = example;
                         spawn(async move {
-                            sleep(Duration::from_secs(3)).await;
+                            sleep(Duration::from_millis(3)).await;
                             *a.lock().unwrap() += 1;
                         });
                         spawn(async move {
-                            sleep(Duration::from_secs(2)).await;
+                            sleep(Duration::from_millis(2)).await;
                             *b.lock().unwrap() += 1;
                         });
                         spawn(async move {
-                            sleep(Duration::from_secs(1)).await;
+                            sleep(Duration::from_millis(1)).await;
                             *c.lock().unwrap() += 1;
                         });
                     }))
@@ -855,15 +663,15 @@ mod test {
                 let b = example.clone();
                 let c = example;
                 spawn(async move {
-                    sleep(Duration::from_secs(3)).await;
+                    sleep(Duration::from_millis(3)).await;
                     *a.lock().unwrap() += 1;
                 });
                 spawn(async move {
-                    sleep(Duration::from_secs(2)).await;
+                    sleep(Duration::from_millis(2)).await;
                     *b.lock().unwrap() += 1;
                 });
                 spawn(async move {
-                    sleep(Duration::from_secs(1)).await;
+                    sleep(Duration::from_millis(1)).await;
                     *c.lock().unwrap() += 1;
                 });
             }))
@@ -881,42 +689,27 @@ mod test {
     #[test]
     fn new_drop() {
         let example = ShareBox::new(());
-        let visitor = example.ptr.clone();
-        println!("new: {:?}", &visitor);
         drop(example);
-        println!("drop: {:?}", &visitor);
     }
 
     #[test]
     fn new_take() {
         let example = ShareBox::new(());
-        let visitor = example.ptr.clone();
-        println!("new: {:?}", &visitor);
         example.into_inner();
-        println!("into: {:?}", &visitor);
     }
 
     #[test]
     fn new_into_ref() {
         let example = ShareBox::new(());
-        let visitor = example.ptr.clone();
-        println!("new: {:?}", &visitor);
         drop(example.into_ref());
-        println!("ref: {:?}", &visitor);
     }
 
     #[tokio::test]
     async fn lil_test() {
         let example = ShareBox::new(());
-        let visitor = example.ptr.clone();
-        println!("new: {:?}", &visitor);
         let (fut, rm) = example.share_mut();
-        println!("shared: {:?}", &visitor);
         drop(rm);
-        println!("dropped: {:?}", &visitor);
         let example = fut.await;
-        println!("awaited: {:?}", &visitor);
         example.into_inner();
-        println!("into: {:?}", &visitor);
     }
 }

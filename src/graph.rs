@@ -1,4 +1,4 @@
-use std::{mem::MaybeUninit, task::Waker, usize};
+use std::{mem::MaybeUninit, task::{Context, Poll, Waker}, usize};
 
 /// A branch in the borrowing chain, used to record forwards / shares.
 struct Branch {
@@ -10,8 +10,6 @@ struct Branch {
     waker: Option<Waker>,
     /// Number of Ref's + RefMut's.
     strong: usize,
-    /// Number of RefMut's.
-    strong_mut: usize,
 }
 
 struct Node {
@@ -43,6 +41,8 @@ impl Node {
         self.version &= -2_i64 as u64;
     }
 }
+
+pub const END: usize = usize::MAX;
 
 pub struct Graph {
     free: usize,
@@ -82,27 +82,13 @@ impl Graph {
     }
 
     pub fn share(&mut self) -> usize {
-        self.forward(usize::MAX)
-    }
-
-    pub fn share_mut(&mut self) -> usize {
-        self.forward_mut(usize::MAX)
+        self.forward(END)
     }
 
     pub fn forward(&mut self, parent: usize) -> usize {
         let node = self.alloc(Branch {
             waker: Some(futures::task::noop_waker()),
             strong: 1,
-            strong_mut: 0
-        });
-        std::mem::replace(&mut node.next, parent)
-    }
-
-    pub fn forward_mut(&mut self, parent: usize) -> usize {
-        let node = self.alloc(Branch {
-            waker: Some(futures::task::noop_waker()),
-            strong: 1,
-            strong_mut: 1
         });
         std::mem::replace(&mut node.next, parent)
     }
@@ -111,6 +97,7 @@ impl Graph {
         self.nodes.get_unchecked_mut(index).log_weak_ref()
     }
 
+    /// Returns true on success.
     pub unsafe fn try_upgrade_weak_unchecked(&mut self, index: usize, version: u64) -> bool {
         let node = self.nodes.get_unchecked_mut(index);
         if node.version != version {
@@ -121,53 +108,19 @@ impl Graph {
         true
     }
 
-    pub unsafe fn track_ref_unchecked(&mut self, index: usize) {
+    pub unsafe fn track_borrow_unchecked(&mut self, index: usize) {
         let branch = self.nodes.get_unchecked_mut(index).branch.assume_init_mut();
         branch.strong += 1;
     }
 
-    pub unsafe fn track_ref_mut_unchecked(&mut self, index: usize) {
-        let branch = self.nodes.get_unchecked_mut(index).branch.assume_init_mut();
-        branch.strong += 1;
-        branch.strong_mut += 1;
-    }
-
     /// Returns true if root is freed.
-    pub unsafe fn untrack_ref_unchecked(&mut self, index: usize) -> bool {
-        if index == usize::MAX {
-            // invalid
-            return true;
-        }
-        let node = self.nodes.get_unchecked_mut(index);
-        let branch = node.branch.assume_init_mut();
-        branch.strong -= 1;
-        if branch.strong == 0 {
-            match branch.waker.as_mut() {
-                Some(waker) => {
-                    std::mem::replace(waker, futures::task::noop_waker()).wake();
-                    false
-                },
-                None => {
-                    Graph::free(&mut self.free, node);
-                    let next = node.next;
-                    self.untrack_ref_mut_unchecked(next)
-                },
-            }
-        } else {
-            false
-        }
-    }
-
-    /// Returns true if root is freed.
-    pub unsafe fn untrack_ref_mut_unchecked(&mut self, mut index: usize) -> bool {
+    pub unsafe fn untrack_borrow_unchecked(&mut self, mut index: usize) -> bool {
         loop {
-            if index == usize::MAX {
-                // invalid
+            if index == END {
                 break true;
             }
             let node = self.nodes.get_unchecked_mut(index);
             let branch = node.branch.assume_init_mut();
-            branch.strong_mut -= 1;
             branch.strong -= 1;
             if branch.strong == 0 {
                 match branch.waker.as_mut() {
@@ -176,7 +129,8 @@ impl Graph {
                         break false;
                     },
                     None => {
-                        index = node.next;
+                        debug_assert_eq!(node.next, index, "Node must point to self before free!");
+                        index = std::mem::replace(&mut node.next, index);
                         Graph::free(&mut self.free, node);
                         continue;
                     },
@@ -191,14 +145,35 @@ impl Graph {
         }
     }
 
-    pub unsafe fn retrack_downgraded_unchecked(&mut self, index: usize) {
-        let branch = self.nodes.get_unchecked_mut(index).branch.assume_init_mut();
-        branch.strong_mut -= 1;
+    /// Returns the parent index.
+    pub unsafe fn poll_unchecked(&mut self, index: usize, cx: &mut Context<'_>) -> Poll<usize> {
+        let node = self.nodes.get_unchecked_mut(index);
+        let branch = node.branch.assume_init_mut();
+        debug_assert!(branch.waker.is_some(), "An open future must have a set waker!");
         if branch.strong == 0 {
-            branch.waker.as_mut().map(|waker| {
-                // potentially spurious wake
-                std::mem::replace(waker, futures::task::noop_waker()).wake()
-            }).unwrap_or(())
+            let parent = std::mem::replace(&mut node.next, index);
+            Graph::free(&mut self.free, node);
+            Poll::Ready(parent)
+        } else {
+            if !branch.waker.as_ref().unwrap_unchecked().will_wake(cx.waker()) {
+                branch.waker = Some(cx.waker().clone())
+            }
+            Poll::Pending
+        }
+    }
+
+    /// Is only true is closure was successful.
+    pub unsafe fn close_future_unchecked(&mut self, index: usize) -> bool {
+        let node = self.nodes.get_unchecked_mut(index);
+        let branch = node.branch.assume_init_mut();
+        debug_assert!(branch.waker.is_some(), "An open future must have a set waker!");
+        if branch.strong == 0 {
+            // assume it has been left in a state to free
+            Graph::free(&mut self.free, node);
+            false
+        } else {
+            branch.waker = None;
+            true
         }
     }
 }
