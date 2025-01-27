@@ -2,9 +2,8 @@ use std::{cell::UnsafeCell, fmt::Debug, future::Future, marker::PhantomData, mem
 
 use futures::{future::FusedFuture, FutureExt};
 
-pub(crate) mod contract;
+mod graph;
 pub mod scope;
-pub mod collections;
 
 // MARK: Inner
 
