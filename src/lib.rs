@@ -169,6 +169,32 @@ impl<T, I: Index> Drop for FuturePtr<T, I> {
     }
 }
 
+// MARK: Black Magic
+
+pub struct Context<'a, T> {
+    ptr: BorrowPtr<T>,
+    _contextualise_ref: PhantomData<fn(&'a T) -> Ref<T>>,
+    _contextualise_mut: PhantomData<fn(&'a mut T) -> RefMut<T>>,
+    _unsync: PhantomData<std::cell::Cell<()>>,
+    _unsend: PhantomData<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl<'a, T> Context<'a, T> {
+    pub fn contextualise_ref<B: ?Sized>(&self, rf: &'a B) -> Ref<T, B> {
+        Ref {
+            ptr: self.ptr.clone(),
+            borrow: rf,
+        }
+    }
+
+    pub fn contextualise_mut<B: ?Sized>(&self, rf_mut: &'a mut B) -> RefMut<T, B> {
+        RefMut {
+            ptr: self.ptr.clone(),
+            borrow: rf_mut
+        }
+    }
+}
+
 // MARK: Smart Pointers
 
 pub struct ShareBox<T> {
@@ -243,14 +269,14 @@ impl<T> ShareBox<T> {
     }
 
     pub fn spawn_ref<U>(self, f: impl FnOnce(Ref<T>) -> U) -> RefShare<T> {
-        let (fut, ptr) = self.share_ref();
-        f(ptr);
+        let (fut, rf) = self.share_ref();
+        f(rf);
         fut
     }
 
     pub fn spawn_mut<U>(self, f: impl FnOnce(RefMut<T>) -> U) -> RefMutShare<T> {
-        let (fut, ptr) = self.share_mut();
-        f(ptr);
+        let (fut, rf_mut) = self.share_mut();
+        f(rf_mut);
         fut
     }
 
@@ -360,6 +386,25 @@ impl<T, B: ?Sized> Ref<T, B> {
         }
     }
 
+    /// Uses the same principle behind other scoping APIs to provide additional support to specific lifetimes.
+    /// 
+    /// The lifetime in question here is the same `'a` as referenced in `Ref::map`, as the true `'a` can not be know
+    /// the lifetime `'_` will be used as a stand_in as it is truly anonymous.
+    pub fn scope<R>(self, f: impl for<'a> FnOnce(&'a B, Context<'a, T>) -> R) -> R {
+        let Ref {
+            ptr,
+            borrow
+        } = self;
+        let context = Context::<'_, T> {
+            ptr,
+            _contextualise_ref: PhantomData,
+            _contextualise_mut: PhantomData,
+            _unsync: PhantomData,
+            _unsend: PhantomData,
+        };
+        f(unsafe { borrow.as_ref().unwrap() }, context)
+    }
+
     pub fn into_deref(self) -> Ref<T, B::Target> where B: Deref {
         Ref::map(self, B::deref)
     }
@@ -444,14 +489,14 @@ impl<T, B: ?Sized> RefMut<T, B> {
     }
 
     pub fn cleave_ref<U>(self, f: impl FnOnce(Ref<T, B>) -> U) -> RefForward<T, B> {
-        let (fut, ptr) = self.forward_ref();
-        f(ptr);
+        let (fut, rf) = self.forward_ref();
+        f(rf);
         fut
     }
 
     pub fn cleave_mut<U>(self, f: impl FnOnce(RefMut<T, B>) -> U) -> RefMutForward<T, B> {
-        let (fut, ptr) = self.forward_mut();
-        f(ptr);
+        let (fut, rf_mut) = self.forward_mut();
+        f(rf_mut);
         fut
     }
 
@@ -464,7 +509,26 @@ impl<T, B: ?Sized> RefMut<T, B> {
         }
     }
 
-    pub fn into_deref(self) -> RefMut<T, B::Target> where B: DerefMut {
+    /// Uses the same principle behind other scoping APIs to provide additional support to specific lifetimes.
+    /// 
+    /// The lifetime in question here is the same `'a` as referenced in `RefMut::map`, as the true `'a` can not be know
+    /// the lifetime `'_` will be used as a stand_in as it is truly anonymous.
+    pub fn scope<R>(self, f: impl for<'a> FnOnce(&'a mut B, Context<'a, T>) -> R) -> R {
+        let RefMut {
+            ptr,
+            borrow
+        } = self;
+        let context = Context::<'_, T> {
+            ptr,
+            _contextualise_ref: PhantomData,
+            _contextualise_mut: PhantomData,
+            _unsync: PhantomData,
+            _unsend: PhantomData,
+        };
+        f(unsafe { borrow.as_mut().unwrap() }, context)
+    }
+
+    pub fn into_deref_mut(self) -> RefMut<T, B::Target> where B: DerefMut {
         RefMut::map(self, B::deref_mut)
     }
 }
@@ -495,10 +559,6 @@ unsafe impl<T: Send + Sync> Send for RefShare<T> {}
 unsafe impl<T: Send + Sync> Sync for RefShare<T> {}
 
 impl<T> RefShare<T> {
-    pub fn get(&self) -> &T {
-        unsafe { self.ptr.shared.as_ref().unwrap().get_ref() }
-    }
-
     pub fn as_ref(&self) -> Ref<T> {
         let shared = self.ptr.shared.as_ref().unwrap().clone();
         let borrow = shared.inner().data.get() as *mut T;
@@ -585,10 +645,6 @@ unsafe impl<T: Send, B: ?Sized + Sync> Send for RefForward<T, B> {}
 unsafe impl<T: Send, B: ?Sized + Sync> Sync for RefForward<T, B> {}
 
 impl<T, B: ?Sized> RefForward<T, B> {
-    pub fn get(&self) -> &T {
-        unsafe { self.ptr.shared.as_ref().unwrap().get_ref() }
-    }
-
     pub fn as_ref(&self) -> Ref<T, B> {
         let shared = self.ptr.shared.as_ref().unwrap().clone();
         let borrow = self.borrow;
@@ -653,6 +709,58 @@ impl<T, B: ?Sized> From<RefForward<T, B>> for RefMutForward<T, B> {
         RefMutForward { ptr: value.ptr, borrow: value.borrow }
     }
 }
+
+// MARK: Wide
+
+#[allow(type_alias_bounds)]
+pub type WideShareBox<T: ?Sized> = ShareBox<Box<T>>;
+
+impl<T: ?Sized> WideShareBox<T> {
+    pub fn share_wide_ref(self) -> (WideRefShare<T>, WideRef<T>) {
+        let (fut, rf) = self.share_ref();
+        (fut, rf.into_deref())
+    }
+
+    pub fn share_wide_mut(self) -> (WideRefMutShare<T>, WideRefMut<T>) {
+        let (fut, rf_mut) = self.share_mut();
+        (fut, rf_mut.into_deref_mut())
+    }
+
+    pub fn spawn_wide_ref<U>(self, f: impl FnOnce(WideRef<T>) -> U) -> WideRefShare<T> {
+        self.spawn_ref(|rf| f(rf.into_deref()))
+    }
+
+    pub fn spawn_wide_mut<U>(self, f: impl FnOnce(WideRefMut<T>) -> U) -> WideRefMutShare<T> {
+        self.spawn_mut(|rf_mut| f(rf_mut.into_deref_mut()))
+    }
+}
+
+#[allow(type_alias_bounds)]
+pub type WideWeak<T: ?Sized, B: ?Sized = T> = Weak<Box<T>, B>;
+
+#[allow(type_alias_bounds)]
+pub type WideRef<T: ?Sized, B: ?Sized = T> = Ref<Box<T>, B>;
+
+#[allow(type_alias_bounds)]
+pub type WideRefMut<T: ?Sized, B: ?Sized = T> = RefMut<Box<T>, B>;
+
+#[allow(type_alias_bounds)]
+pub type WideRefShare<T: ?Sized> = RefShare<Box<T>>;
+
+impl<T: ?Sized> WideRefShare<T> {
+    pub fn as_wide_ref(&self) -> WideRef<T> {
+        self.as_ref().into_deref()
+    }
+}
+
+#[allow(type_alias_bounds)]
+pub type WideRefMutShare<T: ?Sized> = RefMutShare<Box<T>>;
+
+#[allow(type_alias_bounds)]
+pub type WideRefForward<T: ?Sized, B: ?Sized = T> = RefForward<Box<T>, B>;
+
+#[allow(type_alias_bounds)]
+pub type WideRefMutForward<T: ?Sized, B: ?Sized = T> = RefMutForward<Box<T>, B>;
 
 // MARK: Tests
 
@@ -758,5 +866,34 @@ mod test {
         drop(rm);
         let example = fut.await;
         example.into_inner();
+    }
+
+    #[tokio::test]
+    async fn context_test() {
+        use futures::FutureExt;
+        let x =
+            ShareBox::new((0_i8, 0_i8))
+            .spawn_mut(|rf_mut| tokio::spawn(async move {
+                rf_mut
+                    .cleave_mut(|rf_mut| {
+                        let (mut rf_mut_left, mut rf_mut_right) = rf_mut.scope(|(a, b), context| {
+                            (context.contextualise_mut(a), context.contextualise_mut(b))
+                        });
+                        tokio::spawn(async move {
+                            *rf_mut_left += 1
+                        });
+                        tokio::spawn(async move {
+                            *rf_mut_right -= 1
+                        });
+                    })
+                    .map(|mut rf_mut| {
+                        let ab = &mut* rf_mut;
+                        std::mem::swap(&mut ab.0, &mut ab.1)
+                    })
+                    .await
+            }))
+            .await
+            .into_inner();
+            assert_eq!(x, (-1_i8, 1_i8));
     }
 }
