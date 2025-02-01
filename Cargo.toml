@@ -1,6 +1,6 @@
 [package]
 name = "async-borrow"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Async compatible ownership semantics using futures instead of lifetimes."
@@ -9,6 +9,9 @@ readme = "README.md"
 keywords = ["async", "borrow"]
 categories = ["asynchronous"]
 rust-version = "1.65.0" # as calculated by `cargo msrv find`
+
+[lib]
+experimental = true
 
 [dependencies]
 futures = "0.3.31"

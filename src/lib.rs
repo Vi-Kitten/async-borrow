@@ -4,12 +4,13 @@ use futures::future::FusedFuture;
 
 mod graph;
 pub mod scope;
+pub mod slice;
+pub mod prelude;
 
 use graph::Graph;
 
 // MARK: Inner
 
-#[repr(align(4))] // aligned manually for 2 bits of extra space.
 struct BorrowInner<T> {
     weak: AtomicUsize,
     graph: Mutex<Graph>,
@@ -43,6 +44,18 @@ impl<T> SharedPtr<T> {
 
     pub unsafe fn get_mut(&mut self) -> &mut T {
         self.inner().data.get().as_mut().unwrap_unchecked().assume_init_mut()
+    }
+
+    pub fn into_raw(self) -> *mut T {
+        let ptr = unsafe { self.inner.as_ptr().cast::<T>().byte_add(std::mem::offset_of!(BorrowInner<T>, data)) };
+        std::mem::forget(self);
+        ptr
+    }
+
+    pub unsafe fn from_raw(ptr: *mut T) -> Self {
+        SharedPtr {
+            inner: NonNull::new_unchecked(ptr.byte_sub(std::mem::offset_of!(BorrowInner<T>, data)).cast::<BorrowInner<T>>()),
+        }
     }
 }
 
@@ -175,19 +188,21 @@ pub struct Context<'a, T> {
     ptr: BorrowPtr<T>,
     _contextualise_ref: PhantomData<fn(&'a T) -> Ref<T>>,
     _contextualise_mut: PhantomData<fn(&'a mut T) -> RefMut<T>>,
-    _unsync: PhantomData<std::cell::Cell<()>>,
-    _unsend: PhantomData<std::sync::MutexGuard<'static, ()>>,
 }
 
+unsafe impl<'a, T: Send> Send for Context<'a, T> {}
+
+unsafe impl<'a, T: Send> Sync for Context<'a, T> {}
+
 impl<'a, T> Context<'a, T> {
-    pub fn contextualise_ref<B: ?Sized>(&self, rf: &'a B) -> Ref<T, B> {
+    pub fn lift_ref<B: ?Sized>(&self, rf: &'a B) -> Ref<T, B> {
         Ref {
             ptr: self.ptr.clone(),
             borrow: rf,
         }
     }
 
-    pub fn contextualise_mut<B: ?Sized>(&self, rf_mut: &'a mut B) -> RefMut<T, B> {
+    pub fn lift_mut<B: ?Sized>(&self, rf_mut: &'a mut B) -> RefMut<T, B> {
         RefMut {
             ptr: self.ptr.clone(),
             borrow: rf_mut
@@ -220,6 +235,42 @@ impl<T> ShareBox<T> {
         ptr
     }
 
+    /// Converts self into a new ready `RefShare` future.
+    pub fn into_ref_share(self) -> RefShare<T> {
+        let mut graph = self.ptr.inner().graph.lock().unwrap();
+        debug_assert_eq!(graph.share(), 0, r#"
+            Graph should only have one root and it must be the last to be freed,
+            hence it should be at the start of the free list / stack
+            "#
+        );
+        let index = 0;
+        unsafe { graph.untrack_borrow_unchecked(index) };
+        drop(graph);
+        let ptr = self.into_shared();
+        RefShare {
+            ptr: FuturePtr { shared: Some(ptr), index: First },
+            _borrow: PhantomData,
+        }
+    }
+
+    /// Converts self into a new ready `RefMutShare` future.
+    pub fn into_mut_share(self) -> RefMutShare<T> {
+        let mut graph = self.ptr.inner().graph.lock().unwrap();
+        debug_assert_eq!(graph.share(), 0, r#"
+            Graph should only have one root and it must be the last to be freed,
+            hence it should be at the start of the free list / stack
+            "#
+        );
+        let index = 0;
+        unsafe { graph.untrack_borrow_unchecked(index) };
+        drop(graph);
+        let ptr = self.into_shared();
+        RefMutShare {
+            ptr: FuturePtr { shared: Some(ptr), index: First },
+            _borrow: PhantomData,
+        }
+    }
+
     pub fn share_ref(self) -> (RefShare<T>, Ref<T>) {
         let mut graph = self.ptr.inner().graph.lock().unwrap();
         debug_assert_eq!(graph.share(), 0, r#"
@@ -235,7 +286,7 @@ impl<T> ShareBox<T> {
         (
             RefShare {
                 ptr: FuturePtr { shared: Some(ptr), index: First },
-                borrow,
+                _borrow: PhantomData,
             },
             Ref {
                 ptr: BorrowPtr { shared, index },
@@ -259,7 +310,7 @@ impl<T> ShareBox<T> {
         (
             RefMutShare {
                 ptr: FuturePtr { shared: Some(ptr), index: First },
-                borrow,
+                _borrow: PhantomData,
             },
             RefMut {
                 ptr: BorrowPtr { shared, index },
@@ -281,7 +332,7 @@ impl<T> ShareBox<T> {
     }
 
     pub fn into_ref(self) -> Ref<T> {
-        let index = graph::END;
+        let index = 0;
         let shared = self.into_shared();
         let borrow = shared.inner().data.get() as *const T;
         Ref {
@@ -292,7 +343,7 @@ impl<T> ShareBox<T> {
     }
 
     pub fn into_mut(self) -> RefMut<T> {
-        let index = graph::END;
+        let index = 0;
         let shared = self.into_shared();
         let borrow = shared.inner().data.get() as *mut T;
         RefMut {
@@ -303,6 +354,17 @@ impl<T> ShareBox<T> {
 
     pub fn into_inner(self) -> T {
         unsafe { self.into_shared().inner().data.get().as_mut().unwrap_unchecked().assume_init_read() }
+    }
+
+    pub fn into_raw(self) -> *const T {
+        self.into_shared().into_raw()
+    }
+
+    pub unsafe fn from_raw(ptr: *const T) -> ShareBox<T> {
+        ShareBox {
+            ptr: SharedPtr::from_raw(ptr as *mut T),
+            _share: PhantomData
+        }
     }
 }
 
@@ -379,6 +441,14 @@ impl<T, B: ?Sized> Ref<T, B> {
 
     /// Given that `f` works for all lifetimes `'a`, it will also work for
     /// the indeterminable, yet existant, lifetime of the `BorrowInner`.
+    /// 
+    /// # Experimental
+    /// 
+    /// This is intended to be a safe API, and I believe that it is safe,
+    /// however the work to prove this thoroughly is complex and has not yet been undertaken.
+    /// This work will be done before v1.0.0.
+    /// 
+    /// > **Do not rely on this being safe in safety critical contexts**
     pub fn map<C: ?Sized>(self, f: impl for<'a> FnOnce(&'a B) -> &'a C) -> Ref<T, C> {
         Ref {
             ptr: self.ptr,
@@ -390,6 +460,14 @@ impl<T, B: ?Sized> Ref<T, B> {
     /// 
     /// The lifetime in question here is the same `'a` as referenced in `Ref::map`, as the true `'a` can not be know
     /// the lifetime `'_` will be used as a stand_in as it is truly anonymous.
+    /// 
+    /// # Experimental
+    /// 
+    /// This is intended to be a safe API, and I believe that it is safe,
+    /// however the work to prove this thoroughly is complex and has not yet been undertaken.
+    /// This work will be done before v1.0.0.
+    /// 
+    /// > **Do not rely on this being safe in safety critical contexts**
     pub fn scope<R>(self, f: impl for<'a> FnOnce(&'a B, Context<'a, T>) -> R) -> R {
         let Ref {
             ptr,
@@ -399,14 +477,21 @@ impl<T, B: ?Sized> Ref<T, B> {
             ptr,
             _contextualise_ref: PhantomData,
             _contextualise_mut: PhantomData,
-            _unsync: PhantomData,
-            _unsend: PhantomData,
         };
         f(unsafe { borrow.as_ref().unwrap() }, context)
     }
 
+    /// A special case of `Ref::map` to handle dereferencing.
+    /// 
+    /// # Experimental
+    /// 
+    /// This is intended to be a safe API, and I believe that it is safe,
+    /// however the work to prove this thoroughly is complex and has not yet been undertaken.
+    /// This work will be done before v1.0.0.
+    /// 
+    /// > **Do not rely on this being safe in safety critical contexts**
     pub fn into_deref(self) -> Ref<T, B::Target> where B: Deref {
-        Ref::map(self, B::deref)
+        self.map(B::deref)
     }
 }
 
@@ -444,6 +529,36 @@ impl<T, B: ?Sized> RefMut<T, B> {
         } = self;
         Ref {
             ptr,
+            borrow,
+        }
+    }
+
+    /// Converts self into a new ready `RefForward` future.
+    pub fn into_ref_forward(self) -> RefForward<T, B> {
+        let mut graph = self.ptr.inner().graph.lock().unwrap();
+        let index = graph.forward(self.ptr.index);
+        unsafe { graph.untrack_borrow_unchecked(index) };
+        drop(graph);
+        let ptr = SharedPtr { inner: self.ptr.inner };
+        let borrow = self.borrow;
+        std::mem::forget(self.ptr);
+        RefForward {
+            ptr: FuturePtr { shared: Some(ptr), index },
+            borrow,
+        }
+    }
+
+    /// Converts self into a new ready `RefMutForward` future.
+    pub fn into_mut_forward(self) -> RefMutForward<T, B> {
+        let mut graph = self.ptr.inner().graph.lock().unwrap();
+        let index = graph.forward(self.ptr.index);
+        unsafe { graph.untrack_borrow_unchecked(index) };
+        drop(graph);
+        let ptr = SharedPtr { inner: self.ptr.inner };
+        let borrow = self.borrow;
+        std::mem::forget(self.ptr);
+        RefMutForward {
+            ptr: FuturePtr { shared: Some(ptr), index },
             borrow,
         }
     }
@@ -502,6 +617,14 @@ impl<T, B: ?Sized> RefMut<T, B> {
 
     /// Given that `f` works for all lifetimes `'a`, it will also work for
     /// the indeterminable, yet existant, lifetime of the `BorrowInner`.
+    /// 
+    /// # Experimental
+    /// 
+    /// This is intended to be a safe API, and I believe that it is safe,
+    /// however the work to prove this thoroughly is complex and has not yet been undertaken.
+    /// This work will be done before v1.0.0.
+    /// 
+    /// > **Do not rely on this being safe in safety critical contexts**
     pub fn map<C: ?Sized>(self, f: impl for<'a> FnOnce(&'a mut B) -> &'a mut C) -> RefMut<T, C> {
         RefMut {
             ptr: self.ptr,
@@ -513,6 +636,14 @@ impl<T, B: ?Sized> RefMut<T, B> {
     /// 
     /// The lifetime in question here is the same `'a` as referenced in `RefMut::map`, as the true `'a` can not be know
     /// the lifetime `'_` will be used as a stand_in as it is truly anonymous.
+    /// 
+    /// # Experimental
+    /// 
+    /// This is intended to be a safe API, and I believe that it is safe,
+    /// however the work to prove this thoroughly is complex and has not yet been undertaken.
+    /// This work will be done before v1.0.0.
+    /// 
+    /// > **Do not rely on this being safe in safety critical contexts**
     pub fn scope<R>(self, f: impl for<'a> FnOnce(&'a mut B, Context<'a, T>) -> R) -> R {
         let RefMut {
             ptr,
@@ -522,14 +653,12 @@ impl<T, B: ?Sized> RefMut<T, B> {
             ptr,
             _contextualise_ref: PhantomData,
             _contextualise_mut: PhantomData,
-            _unsync: PhantomData,
-            _unsend: PhantomData,
         };
         f(unsafe { borrow.as_mut().unwrap() }, context)
     }
 
     pub fn into_deref_mut(self) -> RefMut<T, B::Target> where B: DerefMut {
-        RefMut::map(self, B::deref_mut)
+        self.map(B::deref_mut)
     }
 }
 
@@ -551,7 +680,7 @@ impl<T, B: ?Sized> DerefMut for RefMut<T, B> {
 
 pub struct RefShare<T> {
     ptr: FuturePtr<T, First>,
-    borrow: *const T,
+    _borrow: PhantomData<*const T>,
 }
 
 unsafe impl<T: Send + Sync> Send for RefShare<T> {}
@@ -559,6 +688,10 @@ unsafe impl<T: Send + Sync> Send for RefShare<T> {}
 unsafe impl<T: Send + Sync> Sync for RefShare<T> {}
 
 impl<T> RefShare<T> {
+    pub fn get(&self) -> Option<&T> {
+        unsafe { self.ptr.shared.as_ref().map(|shared| shared.get_ref()) }
+    }
+
     pub fn as_ref(&self) -> Ref<T> {
         let shared = self.ptr.shared.as_ref().unwrap().clone();
         let borrow = shared.inner().data.get() as *mut T;
@@ -576,13 +709,19 @@ impl<T> RefShare<T> {
         let borrow = self.ptr.shared.as_ref().unwrap().inner().data.get() as *mut T;
         RefForward { ptr: self.ptr.generalise(), borrow }
     }
-}
 
-impl<T> Deref for RefShare<T> {
-    type Target = T;
+    pub fn into_raw(mut self) -> Option<*const T> {
+        self.ptr.shared.take().map(|shared| shared.into_raw() as *const T)
+    }
 
-    fn deref(&self) -> &Self::Target {
-        unsafe { self.borrow.as_ref().unwrap_unchecked() }
+    pub unsafe fn from_raw(ptr: *const T) -> RefShare<T> {
+        RefShare {
+            ptr: FuturePtr {
+                shared: Some(SharedPtr::from_raw(ptr as *mut T)),
+                index: First
+            },
+            _borrow: PhantomData,
+        }
     }
 }
 
@@ -602,7 +741,7 @@ impl<T> FusedFuture for RefShare<T> {
 
 pub struct RefMutShare<T> {
     ptr: FuturePtr<T, First>,
-    borrow: *const T,
+    _borrow: PhantomData<*const T>,
 }
 
 unsafe impl<T: Send> Send for RefMutShare<T> {}
@@ -611,7 +750,22 @@ unsafe impl<T: Sync> Sync for RefMutShare<T> {}
 
 impl<T> RefMutShare<T> {
     pub fn generalise(self) -> RefMutForward<T> {
-        RefMutForward { ptr: self.ptr.generalise(), borrow: self.borrow as *mut T }
+        let borrow = self.ptr.shared.as_ref().unwrap().inner().data.get() as *mut T;
+        RefMutForward { ptr: self.ptr.generalise(), borrow }
+    }
+
+    pub fn into_raw(mut self) -> Option<*const T> {
+        self.ptr.shared.take().map(|shared| shared.into_raw() as *const T)
+    }
+
+    pub unsafe fn from_raw(ptr: *const T) -> RefMutShare<T> {
+        RefMutShare {
+            ptr: FuturePtr {
+                shared: Some(SharedPtr::from_raw(ptr as *mut T)),
+                index: First
+            },
+            _borrow: PhantomData,
+        }
     }
 }
 
@@ -631,7 +785,7 @@ impl<T> FusedFuture for RefMutShare<T> {
 
 impl<T> From<RefShare<T>> for RefMutShare<T> {
     fn from(value: RefShare<T>) -> Self {
-        RefMutShare { ptr: value.ptr, borrow: value.borrow }
+        RefMutShare { ptr: value.ptr, _borrow: value._borrow }
     }
 }
 
@@ -645,6 +799,10 @@ unsafe impl<T: Send, B: ?Sized + Sync> Send for RefForward<T, B> {}
 unsafe impl<T: Send, B: ?Sized + Sync> Sync for RefForward<T, B> {}
 
 impl<T, B: ?Sized> RefForward<T, B> {
+    pub fn get(&self) -> Option<&T> {
+        unsafe { self.ptr.shared.as_ref().map(|shared| shared.get_ref()) }
+    }
+
     pub fn as_ref(&self) -> Ref<T, B> {
         let shared = self.ptr.shared.as_ref().unwrap().clone();
         let borrow = self.borrow;
@@ -656,14 +814,6 @@ impl<T, B: ?Sized> RefForward<T, B> {
             ptr: BorrowPtr { shared, index },
             borrow
         }
-    }
-}
-
-impl<T, B: ?Sized> Deref for RefForward<T, B> {
-    type Target = B;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { self.borrow.as_ref().unwrap_unchecked() }
     }
 }
 
@@ -877,7 +1027,7 @@ mod test {
                 rf_mut
                     .cleave_mut(|rf_mut| {
                         let (mut rf_mut_left, mut rf_mut_right) = rf_mut.scope(|(a, b), context| {
-                            (context.contextualise_mut(a), context.contextualise_mut(b))
+                            (context.lift_mut(a), context.lift_mut(b))
                         });
                         tokio::spawn(async move {
                             *rf_mut_left += 1
