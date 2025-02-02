@@ -138,6 +138,32 @@ impl<T, B> Ref<T, [B]> {
     }
 }
 
+impl<T, B> IntoIterator for Ref<T, [B]> {
+    type Item = Ref<T, B>;
+
+    type IntoIter = Iter<T, B>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Iter { rf: Some(self) }
+    }
+}
+
+#[derive(Clone)]
+pub struct Iter<T, B> {
+    rf: Option<Ref<T, [B]>>
+}
+
+impl<T, B> Iterator for Iter<T, B> {
+    type Item = Ref<T, B>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (x, xs) = Ref::split_first(self.rf.take()?)?;
+        self.rf = Some(xs);
+        Some(x)
+    }
+}
+
+#[derive(Clone)]
 pub struct ChunkBy<T, B, F: for<'a> FnMut(&'a B, &'a B) -> bool> {
     rf: Option<Ref<T, [B]>>,
     f: F
@@ -161,6 +187,7 @@ impl<T, B, F: for<'a> FnMut(&'a B, &'a B) -> bool> Iterator for ChunkBy<T, B, F>
     }
 }
 
+#[derive(Clone)]
 pub struct Chunks<T, B> {
     rf: Option<Ref<T, [B]>>,
     n: usize,
@@ -180,6 +207,7 @@ impl<T, B> Iterator for Chunks<T, B> {
     }
 }
 
+#[derive(Clone)]
 pub struct SplitInclusive<T, B, F: for<'a> FnMut(&'a B) -> bool> {
     rf: Option<Ref<T, [B]>>,
     f: F,
@@ -203,6 +231,7 @@ impl<T, B, F: for<'a> FnMut(&'a B) -> bool> Iterator for SplitInclusive<T, B, F>
     }
 }
 
+#[derive(Clone)]
 pub struct Split<T, B, F: for<'a> FnMut(&'a B) -> bool> {
     rf: Option<Ref<T, [B]>>,
     f: F
@@ -226,6 +255,7 @@ impl<T, B, F: for<'a> FnMut(&'a B) -> bool> Iterator for Split<T, B, F> {
     }
 }
 
+#[derive(Clone)]
 pub struct Windows<T, B> {
     rf: Option<Ref<T, [B]>>,
     n: usize,
@@ -334,6 +364,30 @@ impl<T, B, F: for<'a> FnMut(&'a mut B, &'a mut B) -> bool> Iterator for ChunkByM
             }
         };
         Some(rf_mut)
+    }
+}
+
+impl<T, B> IntoIterator for RefMut<T, [B]> {
+    type Item = RefMut<T, B>;
+
+    type IntoIter = IterMut<T, B>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IterMut { rf: Some(self) }
+    }
+}
+
+pub struct IterMut<T, B> {
+    rf: Option<RefMut<T, [B]>>
+}
+
+impl<T, B> Iterator for IterMut<T, B> {
+    type Item = RefMut<T, B>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (x, xs) = RefMut::split_first_mut(self.rf.take()?)?;
+        self.rf = Some(xs);
+        Some(x)
     }
 }
 

@@ -15,3 +15,4 @@
     - [ ] Have `Context` support these with extra methods.
 - [ ] Consider adding a global context.
 - [x] Introduce checked array methods.
+- [ ] Look into when to impl `Unpin` and re-evaluate `Unpin` in future trait bounds.

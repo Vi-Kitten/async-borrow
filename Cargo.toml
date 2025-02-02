@@ -1,6 +1,6 @@
 [package]
 name = "async-borrow"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 description = "Async compatible ownership semantics using futures instead of lifetimes."
