@@ -39,14 +39,14 @@ impl<T, B> RefForward<T, [B]> {
 
 impl<T, B> Ref<T, [B]> {
     pub fn get(this: Self, index: usize) -> Option<Ref<T, B>> {
-        this.scope(move |this, ctx| {
-            this.get(index).map(|x| ctx.lift_ref(x))
+        this.context(move |this, ctx| {
+            this.get(index).map(|x| ctx.contextualise_ref(x))
         })
     }
 
     pub fn range(this: Self, range: std::ops::Range<usize>) -> Option<Ref<T, [B]>> {
-        this.scope(move |this, ctx| {
-            this.get(range).map(|x| ctx.lift_ref(x))
+        this.context(move |this, ctx| {
+            this.get(range).map(|x| ctx.contextualise_ref(x))
         })
     }
 
@@ -60,16 +60,16 @@ impl<T, B> Ref<T, [B]> {
     }
 
     pub fn split_first(this: Self) -> Option<(Ref<T, B>, Ref<T, [B]>)> {
-        this.scope(move |this, ctx| {
+        this.context(move |this, ctx| {
             let (x, xs) = this.split_first()?;
-            Some((ctx.lift_ref(x), ctx.lift_ref(xs)))
+            Some((ctx.lift_ref(x), ctx.contextualise_ref(xs)))
         })
     }
 
     pub fn split_at(this: Self, mid: usize) -> (Ref<T, [B]>, Ref<T, [B]>) {
-        this.scope(move |this, ctx| {
+        this.context(move |this, ctx| {
             let (x, y) = this.split_at(mid);
-            (ctx.lift_ref(x), ctx.lift_ref(y))
+            (ctx.lift_ref(x), ctx.contextualise_ref(y))
         })
     }
 
@@ -233,14 +233,14 @@ impl<T, B> Iterator for Windows<T, B> {
 
 impl<T, B> RefMut<T, [B]> {
     pub fn get_mut(this: Self, index: usize) -> Option<RefMut<T, B>> {
-        this.scope(move |this, ctx| {
-            this.get_mut(index).map(|x| ctx.lift_mut(x))
+        this.context(move |this, ctx| {
+            this.get_mut(index).map(|x| ctx.contextualise_mut(x))
         })
     }
 
     pub fn range_mut(this: Self, range: std::ops::Range<usize>) -> Option<RefMut<T, [B]>> {
-        this.scope(move |this, ctx| {
-            this.get_mut(range).map(|x| ctx.lift_mut(x))
+        this.context(move |this, ctx| {
+            this.get_mut(range).map(|x| ctx.contextualise_mut(x))
         })
     }
 
@@ -254,16 +254,16 @@ impl<T, B> RefMut<T, [B]> {
     }
 
     pub fn split_first_mut(this: Self) -> Option<(RefMut<T, B>, RefMut<T, [B]>)> {
-        this.scope(move |this, ctx| {
+        this.context(move |this, ctx| {
             let (x, xs) = this.split_first_mut()?;
-            Some((ctx.lift_mut(x), ctx.lift_mut(xs)))
+            Some((ctx.lift_mut(x), ctx.contextualise_mut(xs)))
         })
     }
 
     pub fn split_at_mut(this: Self, mid: usize) -> (RefMut<T, [B]>, RefMut<T, [B]>) {
-        this.scope(move |this, ctx| {
+        this.context(move |this, ctx| {
             let (x, y) = this.split_at_mut(mid);
-            (ctx.lift_mut(x), ctx.lift_mut(y))
+            (ctx.lift_mut(x), ctx.contextualise_mut(y))
         })
     }
 
@@ -452,8 +452,6 @@ impl<T, B> FusedStream for WindowClustersMut<T, B> {
 
 #[cfg(test)]
 mod test {
-    use std::hint;
-
     use futures::StreamExt;
 
     use crate::{RefMut, ShareBox};

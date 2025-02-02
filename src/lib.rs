@@ -1,13 +1,15 @@
-use std::{cell::UnsafeCell, future::Future, marker::PhantomData, mem::MaybeUninit, ops::{Deref, DerefMut}, pin::Pin, ptr::NonNull, sync::{atomic::{AtomicUsize, Ordering}, Mutex}, usize};
+use std::{borrow::{Borrow, BorrowMut}, cell::UnsafeCell, future::Future, marker::PhantomData, mem::MaybeUninit, ops::{Deref, DerefMut}, pin::Pin, ptr::NonNull, sync::{atomic::{AtomicUsize, Ordering}, Mutex}, usize};
 
-use futures::future::FusedFuture;
+use futures::{future::FusedFuture, StreamExt};
 
 mod graph;
 pub mod scope;
 pub mod slice;
 pub mod prelude;
+pub mod tuple;
 
 use graph::Graph;
+use scope::{Anchor, Spawner};
 
 // MARK: Inner
 
@@ -199,19 +201,37 @@ unsafe impl<'a, T: Send> Send for Context<'a, T> {}
 
 unsafe impl<'a, T: Send> Sync for Context<'a, T> {}
 
-impl<'a, T> Context<'a, T> {
-    pub fn lift_ref<B: ?Sized>(&self, rf: &'a B) -> Ref<T, B> {
-        Ref {
+impl<'a, T> Clone for Context<'a, T> {
+    fn clone(&self) -> Self {
+        Self {
             ptr: self.ptr.clone(),
+            _contextualise_ref: PhantomData,
+            _contextualise_mut: PhantomData
+        }
+    }
+}
+
+impl<'a, T> Context<'a, T> {
+    pub fn contextualise_ref<B: ?Sized>(self, rf: &'a B) -> Ref<T, B> {
+        Ref {
+            ptr: self.ptr,
             borrow: rf,
         }
     }
 
-    pub fn lift_mut<B: ?Sized>(&self, rf_mut: &'a mut B) -> RefMut<T, B> {
+    pub fn contextualise_mut<B: ?Sized>(self, rf: &'a mut B) -> RefMut<T, B> {
         RefMut {
-            ptr: self.ptr.clone(),
-            borrow: rf_mut
+            ptr: self.ptr,
+            borrow: rf,
         }
+    }
+
+    pub fn lift_ref<B: ?Sized>(&self, rf: &'a B) -> Ref<T, B> {
+        self.clone().contextualise_ref(rf)
+    }
+
+    pub fn lift_mut<B: ?Sized>(&self, rf_mut: &'a mut B) -> RefMut<T, B> {
+        self.clone().contextualise_mut(rf_mut)
     }
 }
 
@@ -473,7 +493,7 @@ impl<T, B: ?Sized> Ref<T, B> {
     /// This work will be done before v1.0.0.
     /// 
     /// > **Do not rely on this being safe in safety critical contexts**
-    pub fn scope<R>(self, f: impl for<'a> FnOnce(&'a B, Context<'a, T>) -> R) -> R {
+    pub fn context<R>(self, f: impl for<'a> FnOnce(&'a B, Context<'a, T>) -> R) -> R {
         let Ref {
             ptr,
             borrow
@@ -484,6 +504,34 @@ impl<T, B: ?Sized> Ref<T, B> {
             _contextualise_mut: PhantomData,
         };
         f(unsafe { borrow.as_ref().unwrap() }, context)
+    }
+
+    /// Uses the same principle behind other scoping APIs to provide additional support to specific lifetimes.
+    /// 
+    /// The lifetime in question here is the same `'a` as referenced in `Ref::map`, as the true `'a` can not be know
+    /// the lifetime `'_` will be used as a stand_in as it is truly anonymous.
+    /// 
+    /// # Experimental
+    /// 
+    /// This is intended to be a safe API, and I believe that it is safe,
+    /// however the work to prove this thoroughly is complex and has not yet been undertaken.
+    /// This work will be done before v1.0.0.
+    /// 
+    /// > **Do not rely on this being safe in safety critical contexts**
+    pub async fn scope<F: Future>(self, f: impl for<'a> FnOnce(&'a B, Context<'a, T>, Spawner<'a>) -> F) -> F::Output {
+        let Ref {
+            ptr,
+            borrow
+        } = self;
+        let context = Context::<'_, T> {
+            ptr,
+            _contextualise_ref: PhantomData,
+            _contextualise_mut: PhantomData,
+        };
+        let anchor = Anchor::new();
+        let fut = f(unsafe { borrow.as_ref().unwrap() }, context, anchor.spawner.clone());
+        let ((), output) = futures::join!(anchor.stream().collect::<()>(), fut);
+        output
     }
 
     /// A special case of `Ref::map` to handle dereferencing.
@@ -497,6 +545,19 @@ impl<T, B: ?Sized> Ref<T, B> {
     /// > **Do not rely on this being safe in safety critical contexts**
     pub fn into_deref(self) -> Ref<T, B::Target> where B: Deref {
         self.map(B::deref)
+    }
+
+    /// A special case of `Ref::map` to handle borrowing.
+    /// 
+    /// # Experimental
+    /// 
+    /// This is intended to be a safe API, and I believe that it is safe,
+    /// however the work to prove this thoroughly is complex and has not yet been undertaken.
+    /// This work will be done before v1.0.0.
+    /// 
+    /// > **Do not rely on this being safe in safety critical contexts**
+    pub fn into_borrow<C>(self) -> Ref<T, C> where B: Borrow<C> {
+        self.map(B::borrow)
     }
 }
 
@@ -514,6 +575,12 @@ impl<T, B: ?Sized> Clone for Ref<T, B> {
             ptr: self.ptr.clone(),
             borrow: self.borrow
         }
+    }
+}
+
+impl<T, B: ?Sized> From<RefMut<T, B>> for Ref<T, B> {
+    fn from(value: RefMut<T, B>) -> Self {
+        value.into_ref()
     }
 }
 
@@ -649,7 +716,7 @@ impl<T, B: ?Sized> RefMut<T, B> {
     /// This work will be done before v1.0.0.
     /// 
     /// > **Do not rely on this being safe in safety critical contexts**
-    pub fn scope<R>(self, f: impl for<'a> FnOnce(&'a mut B, Context<'a, T>) -> R) -> R {
+    pub fn context<R>(self, f: impl for<'a> FnOnce(&'a mut B, Context<'a, T>) -> R) -> R {
         let RefMut {
             ptr,
             borrow
@@ -662,8 +729,58 @@ impl<T, B: ?Sized> RefMut<T, B> {
         f(unsafe { borrow.as_mut().unwrap() }, context)
     }
 
+    /// Uses the same principle behind other scoping APIs to provide additional support to specific lifetimes.
+    /// 
+    /// The lifetime in question here is the same `'a` as referenced in `RefMut::map`, as the true `'a` can not be know
+    /// the lifetime `'_` will be used as a stand_in as it is truly anonymous.
+    /// 
+    /// # Experimental
+    /// 
+    /// This is intended to be a safe API, and I believe that it is safe,
+    /// however the work to prove this thoroughly is complex and has not yet been undertaken.
+    /// This work will be done before v1.0.0.
+    /// 
+    /// > **Do not rely on this being safe in safety critical contexts**
+    pub async fn scope<F: Future>(self, f: impl for<'a> FnOnce(&'a mut B, Context<'a, T>, Spawner<'a>) -> F) -> F::Output {
+        let RefMut {
+            ptr,
+            borrow
+        } = self;
+        let context = Context::<'_, T> {
+            ptr,
+            _contextualise_ref: PhantomData,
+            _contextualise_mut: PhantomData,
+        };
+        let anchor = Anchor::new();
+        let fut = f(unsafe { borrow.as_mut().unwrap() }, context, anchor.spawner.clone());
+        let ((), output) = futures::join!(anchor.stream().collect::<()>(), fut);
+        output
+    }
+
+    /// A special case of `RefMut::map` to handle dereferencing.
+    /// 
+    /// # Experimental
+    /// 
+    /// This is intended to be a safe API, and I believe that it is safe,
+    /// however the work to prove this thoroughly is complex and has not yet been undertaken.
+    /// This work will be done before v1.0.0.
+    /// 
+    /// > **Do not rely on this being safe in safety critical contexts**
     pub fn into_deref_mut(self) -> RefMut<T, B::Target> where B: DerefMut {
         self.map(B::deref_mut)
+    }
+
+    /// A special case of `RefMut::map` to handle borrowing.
+    /// 
+    /// # Experimental
+    /// 
+    /// This is intended to be a safe API, and I believe that it is safe,
+    /// however the work to prove this thoroughly is complex and has not yet been undertaken.
+    /// This work will be done before v1.0.0.
+    /// 
+    /// > **Do not rely on this being safe in safety critical contexts**
+    pub fn into_borrow_mut<C>(self) -> RefMut<T, C> where B: BorrowMut<C> {
+        self.map(B::borrow_mut)
     }
 }
 
@@ -1031,7 +1148,7 @@ mod test {
             .spawn_mut(|rf_mut| tokio::spawn(async move {
                 rf_mut
                     .cleave_mut(|rf_mut| {
-                        let (mut rf_mut_left, mut rf_mut_right) = rf_mut.scope(|(a, b), context| {
+                        let (mut rf_mut_left, mut rf_mut_right) = rf_mut.context(|(a, b), context| {
                             (context.lift_mut(a), context.lift_mut(b))
                         });
                         tokio::spawn(async move {

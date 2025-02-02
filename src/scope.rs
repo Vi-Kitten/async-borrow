@@ -8,7 +8,7 @@ use futures::{stream::FusedStream, Stream, StreamExt};
 ///
 /// *can be safely broadened as it can only spawn tasks.*
 #[derive(Debug, Clone)]
-pub struct Spawner</* In */ 'env, /* In */ T>(
+pub struct Spawner</* In */ 'env, /* In */ T = ()>(
     futures::channel::mpsc::UnboundedSender</* In */ Pin<Box<dyn Future<Output = T> + 'env>>>,
 );
 
@@ -25,7 +25,7 @@ impl<'env, T> Spawner<'env, T> {
 
 /// An anchor to handle safe scoped task "spawning".
 #[derive(Debug)]
-pub struct Anchor</* Mix */ 'env, /* Mix */ T> {
+pub struct Anchor</* Mix */ 'env, /* Mix */ T = ()> {
     receiver: futures::channel::mpsc::UnboundedReceiver<
         /* Out */ Pin<Box<dyn Future<Output = T> + 'env>>,
     >,
@@ -70,7 +70,7 @@ impl<'env, T> DerefMut for Anchor<'env, T> {
 /// *can safely be narrowed as no more tasks can be spawned to it.*
 #[derive(Debug)]
 #[must_use = "streams do nothing unless polled"]
-pub struct Pool</* Out */ 'env, /* Out */ T> {
+pub struct Pool</* Out */ 'env, /* Out */ T = ()> {
     receiver: futures::channel::mpsc::UnboundedReceiver<
         /* Out */ Pin<Box<dyn Future<Output = T> + 'env>>,
     >,
