@@ -5,35 +5,68 @@ use futures::{stream::FusedStream, FutureExt, Stream};
 use crate::{Ref, RefMut, RefForward, RefMutForward};
 
 impl<T, B> RefForward<T, [B]> {
-    pub fn map_by_index(this: Self, index: usize) -> Option<RefForward<T, B>> {
+    pub fn map_by_index(this: Self, index: usize) -> Result<RefForward<T, B>, Self> {
         if index < this.borrow.len() {
-            Some(RefForward {
+            Ok(RefForward {
                 ptr: this.ptr,
                 borrow: unsafe { (this.borrow as *mut B).add(index) },
             })
         } else {
-            None
+            Err(this)
         }
     }
 
-    pub fn map_by_range(this: Self, range: std::ops::Range<usize>) -> Option<RefForward<T, [B]>> {
+    pub fn map_by_range(this: Self, range: std::ops::Range<usize>) -> Result<RefForward<T, [B]>, Self> {
         if range.end <= this.borrow.len() && range.start < this.borrow.len() {
-            Some(RefForward {
+            Ok(RefForward {
                 ptr: this.ptr,
                 borrow: unsafe { ptr::slice_from_raw_parts_mut((this.borrow as *mut B).add(range.start), range.len()) }
             })
         } else {
-            None
+            Err(this)
         }
     }
 
-    pub fn map_first(this: Self) -> Option<RefForward<T, B>> {
+    pub fn map_first(this: Self) -> Result<RefForward<T, B>, Self> {
         RefForward::map_by_index(this, 0)
     }
 
-    pub fn map_skip_first(this: Self) -> Option<RefForward<T, [B]>> {
+    pub fn map_skip_first(this: Self) -> Result<RefForward<T, [B]>, Self> {
         let len = this.borrow.len();
         RefForward::map_by_range(this, 1..len)
+    }
+}
+
+impl<T, B> RefMutForward<T, [B]> {
+    pub fn map_by_index_mut(this: Self, index: usize) -> Result<RefMutForward<T, B>, Self> {
+        if index < this.borrow.len() {
+            Ok(RefMutForward {
+                ptr: this.ptr,
+                borrow: unsafe { (this.borrow as *mut B).add(index) },
+            })
+        } else {
+            Err(this)
+        }
+    }
+
+    pub fn map_by_range_mut(this: Self, range: std::ops::Range<usize>) -> Result<RefMutForward<T, [B]>, Self> {
+        if range.end <= this.borrow.len() && range.start < this.borrow.len() {
+            Ok(RefMutForward {
+                ptr: this.ptr,
+                borrow: unsafe { ptr::slice_from_raw_parts_mut((this.borrow as *mut B).add(range.start), range.len()) }
+            })
+        } else {
+            Err(this)
+        }
+    }
+
+    pub fn map_first_mut(this: Self) -> Result<RefMutForward<T, B>, Self> {
+        RefMutForward::map_by_index_mut(this, 0)
+    }
+
+    pub fn map_skip_first_mut(this: Self) -> Result<RefMutForward<T, [B]>, Self> {
+        let len = this.borrow.len();
+        RefMutForward::map_by_range_mut(this, 1..len)
     }
 }
 
@@ -71,6 +104,17 @@ impl<T, B> Ref<T, [B]> {
             let (x, y) = this.split_at(mid);
             (ctx.lift_ref(x), ctx.contextualise_ref(y))
         })
+    }
+
+    pub fn split_at_checked(this: Self, mid: usize) -> Result<(Ref<T, [B]>, Ref<T, [B]>), Self> {
+        if mid <= this.len() {
+            this.context(move |this, ctx| unsafe {
+                let (x, y) = this.split_at_unchecked(mid);
+                Ok((ctx.lift_ref(x), ctx.contextualise_ref(y)))
+            })
+        } else {
+            Err(this)
+        }
     }
 
     pub fn chunk_by<F: for<'a> FnMut(&'a B, &'a B) -> bool>(this: Self, f: F) -> ChunkBy<T, B, F> {
@@ -164,39 +208,6 @@ pub struct Split<T, B, F: for<'a> FnMut(&'a B) -> bool> {
     f: F
 }
 
-impl<T, B> RefMutForward<T, [B]> {
-    pub fn map_by_index_mut(this: Self, index: usize) -> Option<RefMutForward<T, B>> {
-        if index < this.borrow.len() {
-            Some(RefMutForward {
-                ptr: this.ptr,
-                borrow: unsafe { (this.borrow as *mut B).add(index) },
-            })
-        } else {
-            None
-        }
-    }
-
-    pub fn map_by_range_mut(this: Self, range: std::ops::Range<usize>) -> Option<RefMutForward<T, [B]>> {
-        if range.end <= this.borrow.len() && range.start < this.borrow.len() {
-            Some(RefMutForward {
-                ptr: this.ptr,
-                borrow: unsafe { ptr::slice_from_raw_parts_mut((this.borrow as *mut B).add(range.start), range.len()) }
-            })
-        } else {
-            None
-        }
-    }
-
-    pub fn map_first_mut(this: Self) -> Option<RefMutForward<T, B>> {
-        RefMutForward::map_by_index_mut(this, 0)
-    }
-
-    pub fn map_skip_first_mut(this: Self) -> Option<RefMutForward<T, [B]>> {
-        let len = this.borrow.len();
-        RefMutForward::map_by_range_mut(this, 1..len)
-    }
-}
-
 impl<T, B, F: for<'a> FnMut(&'a B) -> bool> Iterator for Split<T, B, F> {
     type Item = Ref<T, [B]>;
 
@@ -265,6 +276,17 @@ impl<T, B> RefMut<T, [B]> {
             let (x, y) = this.split_at_mut(mid);
             (ctx.lift_mut(x), ctx.contextualise_mut(y))
         })
+    }
+
+    pub fn split_at_mut_checked(this: Self, mid: usize) -> Result<(RefMut<T, [B]>, RefMut<T, [B]>), Self> {
+        if mid <= this.len() {
+            this.context(move |this, ctx| unsafe {
+                let (x, y) = this.split_at_mut_unchecked(mid);
+                Ok((ctx.lift_mut(x), ctx.contextualise_mut(y)))
+            })
+        } else {
+            Err(this)
+        }
     }
 
     pub fn chunk_by_mut<F: for<'a> FnMut(&'a mut B, &'a mut B) -> bool>(this: Self, f: F) -> ChunkByMut<T, B, F> {
@@ -397,7 +419,7 @@ impl<T, B> Stream for WindowsMut<T, B> {
                 let Some(xs) = RefMut::range_mut(rf_mut, 0..self.size) else {
                     return Poll::Ready(None)
                 };
-                self.fut = RefMutForward::map_skip_first_mut(fut);
+                self.fut = RefMutForward::map_skip_first_mut(fut).ok();
                 Poll::Ready(Some(xs))
             },
             Poll::Pending => {
@@ -433,7 +455,7 @@ impl<T, B> Stream for WindowClustersMut<T, B> {
             Poll::Ready(rf_mut) => {
                 self.n += 1;
                 let (fut, rf_mut) = rf_mut.forward_mut();
-                self.fut = RefMutForward::map_skip_first_mut(fut);
+                self.fut = RefMutForward::map_skip_first_mut(fut).ok();
                 Poll::Ready(Some(RefMut::chunks_mut(rf_mut, self.size)))
             },
             Poll::Pending => {
