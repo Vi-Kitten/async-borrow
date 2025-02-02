@@ -815,6 +815,14 @@ unsafe impl<T: Send + Sync> Send for RefShare<T> {}
 unsafe impl<T: Send + Sync> Sync for RefShare<T> {}
 
 impl<T> RefShare<T> {
+    pub fn spawn(&mut self) -> SpawnRef<'_, T> {
+        SpawnRef { fut: self }
+    }
+
+    pub fn spawn_while<F: Unpin + for<'a> FnMut(&'a mut T) -> bool>(&mut self, f: F) -> SpawnRefWhile<'_, T, F> {
+        SpawnRefWhile { fut: self, f }
+    }
+
     pub fn get(&self) -> Option<&T> {
         unsafe { self.ptr.shared.as_ref().map(|shared| shared.get_ref()) }
     }
@@ -876,6 +884,14 @@ unsafe impl<T: Send> Send for RefMutShare<T> {}
 unsafe impl<T: Sync> Sync for RefMutShare<T> {}
 
 impl<T> RefMutShare<T> {
+    pub fn spawn_mut(&mut self) -> SpawnRefMut<'_, T> {
+        SpawnRefMut { fut: self }
+    }
+
+    pub fn spawn_mut_while<F: Unpin + for<'a> FnMut(&'a mut T) -> bool>(&mut self, f: F) -> SpawnRefMutWhile<'_, T, F> {
+        SpawnRefMutWhile { fut: self, f }
+    }
+
     pub fn generalise(self) -> RefMutForward<T> {
         let borrow = self.ptr.shared.as_ref().unwrap().inner().data.get() as *mut T;
         RefMutForward { ptr: self.ptr.generalise(), borrow }
@@ -926,6 +942,14 @@ unsafe impl<T: Send, B: ?Sized + Sync> Send for RefForward<T, B> {}
 unsafe impl<T: Send, B: ?Sized + Sync> Sync for RefForward<T, B> {}
 
 impl<T, B: ?Sized> RefForward<T, B> {
+    pub fn split(&mut self) -> SplitRef<'_, T, B> {
+        SplitRef { fut: self }
+    }
+
+    pub fn split_while<F: Unpin + for<'a> FnMut(&'a mut B) -> bool>(&mut self, f: F) -> SplitRefWhile<'_, T, B, F> {
+        SplitRefWhile { fut: self, f }
+    }
+
     pub fn get(&self) -> Option<&T> {
         unsafe { self.ptr.shared.as_ref().map(|shared| shared.get_ref()) }
     }
@@ -967,6 +991,16 @@ unsafe impl<T: Send, B: ?Sized + Send> Send for RefMutForward<T, B> {}
 
 unsafe impl<T, B: ?Sized + Sync> Sync for RefMutForward<T, B> {}
 
+impl<T, B: ?Sized> RefMutForward<T, B> {
+    pub fn split_mut(&mut self) -> SplitRefMut<'_, T, B> {
+        SplitRefMut { fut: self }
+    }
+
+    pub fn split_mut_while<F: Unpin + for<'a> FnMut(&'a mut B) -> bool>(&mut self, f: F) -> SplitRefMutWhile<'_, T, B, F> {
+        SplitRefMutWhile { fut: self, f }
+    }
+}
+
 impl<T, B: ?Sized> Future for RefMutForward<T, B> {
     type Output = RefMut<T, B>;
 
@@ -987,14 +1021,150 @@ impl<T, B: ?Sized> From<RefForward<T, B>> for RefMutForward<T, B> {
     }
 }
 
+pub struct SpawnRef<'f, T> {
+    fut: &'f mut RefShare<T>
+}
+
+impl<'f, T> Future for SpawnRef<'f, T> {
+    type Output = Ref<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        use std::task::Poll;
+        match self.fut.poll_unpin(cx) {
+            Poll::Ready(owner) => {
+                let (fut, rf) = owner.share_ref();
+                *self.fut = fut;
+                Poll::Ready(rf)
+            },
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<'f, T> Deref for SpawnRef<'f, T> {
+    type Target = RefShare<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.fut
+    }
+}
+
+impl<'f, T> DerefMut for SpawnRef<'f, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.fut
+    }
+}
+
+pub struct SpawnRefMut<'f, T> {
+    fut: &'f mut RefMutShare<T>
+}
+
+impl<'f, T> Future for SpawnRefMut<'f, T> {
+    type Output = RefMut<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        use std::task::Poll;
+        match self.fut.poll_unpin(cx) {
+            Poll::Ready(owner) => {
+                let (fut, rf_mut) = owner.share_mut();
+                *self.fut = fut;
+                Poll::Ready(rf_mut)
+            },
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<'f, T> Deref for SpawnRefMut<'f, T> {
+    type Target = RefMutShare<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.fut
+    }
+}
+
+impl<'f, T> DerefMut for SpawnRefMut<'f, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.fut
+    }
+}
+
+pub struct SplitRef<'f, T, B: ?Sized> {
+    fut: &'f mut RefForward<T, B>
+}
+
+impl<'f, T, B: ?Sized> Future for SplitRef<'f, T, B> {
+    type Output = Ref<T, B>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        use std::task::Poll;
+        match self.fut.poll_unpin(cx) {
+            Poll::Ready(rf_mut) => {
+                let (fut, rf) = rf_mut.forward_ref();
+                *self.fut = fut;
+                Poll::Ready(rf)
+            },
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<'f, T, B: ?Sized> Deref for SplitRef<'f, T, B> {
+    type Target = RefForward<T, B>;
+
+    fn deref(&self) -> &Self::Target {
+        self.fut
+    }
+}
+
+impl<'f, T, B: ?Sized> DerefMut for SplitRef<'f, T, B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.fut
+    }
+}
+
+pub struct SplitRefMut<'f, T, B: ?Sized> {
+    fut: &'f mut RefMutForward<T, B>
+}
+
+impl<'f, T, B: ?Sized> Future for SplitRefMut<'f, T, B> {
+    type Output = RefMut<T, B>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        use std::task::Poll;
+        match self.fut.poll_unpin(cx) {
+            Poll::Ready(rf_mut) => {
+                let (fut, rf_mut) = rf_mut.forward_mut();
+                *self.fut = fut;
+                Poll::Ready(rf_mut)
+            },
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<'f, T, B: ?Sized> Deref for SplitRefMut<'f, T, B> {
+    type Target = RefMutForward<T, B>;
+
+    fn deref(&self) -> &Self::Target {
+        self.fut
+    }
+}
+
+impl<'f, T, B: ?Sized> DerefMut for SplitRefMut<'f, T, B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.fut
+    }
+}
+
 // MARK: Streams
 
-pub struct ShareRefWhile<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> {
+pub struct SpawnRefWhile<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> {
     fut: &'f mut RefShare<T>,
     f: F
 }
 
-impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> Stream for ShareRefWhile<'f, T, F> {
+impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> Stream for SpawnRefWhile<'f, T, F> {
     type Item = Ref<T>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
@@ -1015,7 +1185,7 @@ impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> Stream for ShareRefWhil
     }
 }
 
-impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> Deref for ShareRefWhile<'f, T, F> {
+impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> Deref for SpawnRefWhile<'f, T, F> {
     type Target = RefShare<T>;
 
     fn deref(&self) -> &Self::Target {
@@ -1023,18 +1193,18 @@ impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> Deref for ShareRefWhile
     }
 }
 
-impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> DerefMut for ShareRefWhile<'f, T, F> {
+impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> DerefMut for SpawnRefWhile<'f, T, F> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.fut
     }
 }
 
-pub struct ShareRefMutWhile<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> {
+pub struct SpawnRefMutWhile<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> {
     fut: &'f mut RefMutShare<T>,
     f: F
 }
 
-impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> Stream for ShareRefMutWhile<'f, T, F> {
+impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> Stream for SpawnRefMutWhile<'f, T, F> {
     type Item = RefMut<T>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
@@ -1055,7 +1225,7 @@ impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> Stream for ShareRefMutW
     }
 }
 
-impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> Deref for ShareRefMutWhile<'f, T, F> {
+impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> Deref for SpawnRefMutWhile<'f, T, F> {
     type Target = RefMutShare<T>;
 
     fn deref(&self) -> &Self::Target {
@@ -1063,18 +1233,18 @@ impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> Deref for ShareRefMutWh
     }
 }
 
-impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> DerefMut for ShareRefMutWhile<'f, T, F> {
+impl<'f, T, F: Unpin + for<'a> FnMut(&'a mut T) -> bool> DerefMut for SpawnRefMutWhile<'f, T, F> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.fut
     }
 }
 
-pub struct ForwardRefWhile<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> {
+pub struct SplitRefWhile<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> {
     fut: &'f mut RefForward<T, B>,
     f: F
 }
 
-impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> Stream for ForwardRefWhile<'f, T, B, F> {
+impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> Stream for SplitRefWhile<'f, T, B, F> {
     type Item = Ref<T, B>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
@@ -1095,7 +1265,7 @@ impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> Stream for F
     }
 }
 
-impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> Deref for ForwardRefWhile<'f, T, B, F> {
+impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> Deref for SplitRefWhile<'f, T, B, F> {
     type Target = RefForward<T, B>;
 
     fn deref(&self) -> &Self::Target {
@@ -1103,18 +1273,18 @@ impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> Deref for Fo
     }
 }
 
-impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> DerefMut for ForwardRefWhile<'f, T, B, F> {
+impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> DerefMut for SplitRefWhile<'f, T, B, F> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.fut
     }
 }
 
-pub struct ForwardRefMutWhile<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> {
+pub struct SplitRefMutWhile<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> {
     fut: &'f mut RefMutForward<T, B>,
     f: F
 }
 
-impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> Stream for ForwardRefMutWhile<'f, T, B, F> {
+impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> Stream for SplitRefMutWhile<'f, T, B, F> {
     type Item = RefMut<T, B>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
@@ -1135,7 +1305,7 @@ impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> Stream for F
     }
 }
 
-impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> Deref for ForwardRefMutWhile<'f, T, B, F> {
+impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> Deref for SplitRefMutWhile<'f, T, B, F> {
     type Target = RefMutForward<T, B>;
 
     fn deref(&self) -> &Self::Target {
@@ -1143,7 +1313,7 @@ impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> Deref for Fo
     }
 }
 
-impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> DerefMut for ForwardRefMutWhile<'f, T, B, F> {
+impl<'f, T, B: ?Sized, F: Unpin + for<'a> FnMut(&'a mut B) -> bool> DerefMut for SplitRefMutWhile<'f, T, B, F> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.fut
     }

@@ -14,5 +14,6 @@
 - [ ] Create `Ref` and `RefMut` compatable async lock primitives.
     - [ ] Have `Context` support these with extra methods.
 - [ ] Consider adding a global context.
+- [ ] Make some slice methods non static.
 - [x] Introduce checked array methods.
 - [ ] Look into when to impl `Unpin` and re-evaluate `Unpin` in future trait bounds.
