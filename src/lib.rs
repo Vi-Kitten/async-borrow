@@ -23,6 +23,10 @@ struct SharedPtr<T> {
     inner: NonNull<BorrowInner<T>>
 }
 
+unsafe impl<T> Send for SharedPtr<T> {}
+
+unsafe impl<T> Sync for SharedPtr<T> {}
+
 impl<T> SharedPtr<T> {
     pub fn new(data: T) -> Self {
         SharedPtr {
@@ -173,11 +177,12 @@ impl<T, I: Index> FusedFuture for FuturePtr<T, I> {
 
 impl<T, I: Index> Drop for FuturePtr<T, I> {
     fn drop(&mut self) {
-        let Some(shared) = self.shared.as_ref() else { return };
+        let Some(shared) = self.shared.take() else { return };
         let mut graph = shared.inner().graph.lock().unwrap();
-        if unsafe { !graph.close_future_unchecked(self.index.get()) } {
+        if unsafe { graph.close_future_unchecked(self.index.get()) } {
+            unsafe { shared.inner().data.get().as_mut().unwrap_unchecked().assume_init_drop() };
             drop(graph); // release mutex
-            unsafe { drop(self.shared.take().unwrap_unchecked()) }
+            drop(shared)
         }
     }
 }
@@ -1045,5 +1050,51 @@ mod test {
             .await
             .into_inner();
             assert_eq!(x, (-1_i8, 1_i8));
+    }
+
+    #[tokio::test]
+    async fn test_into_mut_share() {
+        ShareBox::new(())
+            .into_mut_share()
+            .await
+            .into_inner()
+    }
+
+    #[tokio::test]
+    async fn test_into_mut_forward() {
+        ShareBox::new(())
+            .spawn_mut(|rf_mut| tokio::spawn(async move {
+                rf_mut
+                    .into_mut_forward()
+                    .await
+            }))
+            .await
+            .into_inner()
+    }
+
+    #[tokio::test]
+    async fn test_drop_forward_then_drop_future() {
+        ShareBox::new(())
+            .spawn_mut(|rf_mut| tokio::spawn(async move {
+                let (fut, rf_mut) = rf_mut
+                    .forward_mut();
+                drop(rf_mut);
+                drop(fut);
+            }))
+            .await
+            .into_inner()
+    }
+
+    #[tokio::test]
+    async fn test_drop_future_then_drop_forward() {
+        ShareBox::new(())
+            .spawn_mut(|rf_mut| tokio::spawn(async move {
+                let (fut, rf_mut) = rf_mut
+                    .forward_mut();
+                drop(fut);
+                drop(rf_mut);
+            }))
+            .await
+            .into_inner()
     }
 }

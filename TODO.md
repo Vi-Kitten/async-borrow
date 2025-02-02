@@ -1,5 +1,6 @@
 # TODO
 
+- [x] Make graph waking take on wake.
 - [ ] Make slice methods return results on failure.
 - [ ] Vibe check `Weak`.
 - [ ] Take effort to ensure that slice methods match those in std lib.

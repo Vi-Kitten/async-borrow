@@ -75,10 +75,12 @@ impl Graph {
         node
     }
 
-    unsafe fn free(free: &mut usize, node: &mut Node) {
+    unsafe fn free(free: &mut usize, node: &mut Node, index: usize) -> usize {
         node.branch.assume_init_drop();
         node.flush_weak_refs();
+        let parent = std::mem::replace(&mut node.next, index);
         std::mem::swap(free, &mut node.next);
+        parent
     }
 
     pub fn share(&mut self) -> usize {
@@ -114,6 +116,8 @@ impl Graph {
     }
 
     /// Returns true if root is freed.
+    /// 
+    /// If true, if is your responsiblity to free the shared data.
     pub unsafe fn untrack_borrow_unchecked(&mut self, mut index: usize) -> bool {
         loop {
             if index == END {
@@ -123,15 +127,13 @@ impl Graph {
             let branch = node.branch.assume_init_mut();
             branch.strong -= 1;
             if branch.strong == 0 {
-                match branch.waker.as_mut() {
+                match branch.waker.take() {
                     Some(waker) => {
-                        std::mem::replace(waker, futures::task::noop_waker()).wake();
+                        waker.wake();
                         break false;
                     },
                     None => {
-                        debug_assert_eq!(node.next, index, "Node must point to self before free!");
-                        index = std::mem::replace(&mut node.next, index);
-                        Graph::free(&mut self.free, node);
+                        index = Graph::free(&mut self.free, node, index);
                         continue;
                     },
                 }
@@ -146,34 +148,37 @@ impl Graph {
     }
 
     /// Returns the parent index.
+    /// 
+    /// You are now responsible for maintaining a borrow pointer with the given index.
     pub unsafe fn poll_unchecked(&mut self, index: usize, cx: &mut Context<'_>) -> Poll<usize> {
         let node = self.nodes.get_unchecked_mut(index);
         let branch = node.branch.assume_init_mut();
-        debug_assert!(branch.waker.is_some(), "An open future must have a set waker!");
-        if branch.strong == 0 {
-            let parent = std::mem::replace(&mut node.next, index);
-            Graph::free(&mut self.free, node);
-            Poll::Ready(parent)
-        } else {
-            if !branch.waker.as_ref().unwrap_unchecked().will_wake(cx.waker()) {
-                branch.waker = Some(cx.waker().clone())
-            }
-            Poll::Pending
+        match branch.waker.as_mut() {
+            Some(waker) => {
+                if !waker.will_wake(cx.waker()) {
+                    *waker = cx.waker().clone();
+                }
+                Poll::Pending
+            },
+            None => {
+                let parent = Graph::free(&mut self.free, node, index);
+                Poll::Ready(parent)
+            },
         }
     }
 
-    /// Is only true is closure was successful.
+    /// Returns true if root is freed.
+    /// 
+    /// If true, if is your responsiblity to free the shared data.
     pub unsafe fn close_future_unchecked(&mut self, index: usize) -> bool {
         let node = self.nodes.get_unchecked_mut(index);
         let branch = node.branch.assume_init_mut();
-        debug_assert!(branch.waker.is_some(), "An open future must have a set waker!");
-        if branch.strong == 0 {
-            // assume it has been left in a state to free
-            Graph::free(&mut self.free, node);
-            false
-        } else {
-            branch.waker = None;
-            true
+        match branch.waker.take() {
+            Some(..) => false,
+            None => {
+                let parent = Graph::free(&mut self.free, node, index);
+                unsafe { self.untrack_borrow_unchecked(parent) }
+            },
         }
     }
 }

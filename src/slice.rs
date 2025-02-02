@@ -1,6 +1,6 @@
 use std::ptr;
 
-use futures::{FutureExt, Stream};
+use futures::{stream::FusedStream, FutureExt, Stream};
 
 use crate::{Ref, RefMut, RefForward, RefMutForward};
 
@@ -408,6 +408,12 @@ impl<T, B> Stream for WindowsMut<T, B> {
     }
 }
 
+impl<T, B> FusedStream for WindowsMut<T, B> {
+    fn is_terminated(&self) -> bool {
+        self.fut.is_none()
+    }
+}
+
 pub struct WindowClustersMut<T, B> {
     fut: Option<RefMutForward<T, [B]>>,
     size: usize,
@@ -435,5 +441,62 @@ impl<T, B> Stream for WindowClustersMut<T, B> {
                 Poll::Pending
             },
         }
+    }
+}
+
+impl<T, B> FusedStream for WindowClustersMut<T, B> {
+    fn is_terminated(&self) -> bool {
+        self.fut.is_none()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::hint;
+
+    use futures::StreamExt;
+
+    use crate::{RefMut, ShareBox};
+
+    #[tokio::test]
+    async fn test_split() {
+        ShareBox::<Vec<u8>>::new(vec![0, 1, 2, 3])
+            .spawn_mut(|xs| tokio::spawn(async move {
+                let xs: RefMut<Vec<u8>, [u8]> = xs.into_deref_mut();
+                let (lft, rgh) = RefMut::split_at_mut(xs, 2);
+                drop(lft);
+                drop(rgh);
+            }))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_windows_mut() {
+        ShareBox::<Vec<u8>>::new(vec![0, 1, 2, 3])
+            .spawn_mut(|xs| tokio::spawn(async move {
+                let xs: RefMut<Vec<u8>, [u8]> = xs.into_deref_mut();
+                let mut stream = RefMut::windows_mut(xs, 2);
+                let mut ys = Vec::new();
+                while let Some(xs) = stream.next().await {
+                    ys.push(xs.iter().sum::<u8>())
+                }
+                assert_eq!(&*ys, &[1, 3, 5])
+            }))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_window_clusters_mut() {
+        ShareBox::<Vec<u8>>::new(vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0])
+            .spawn_mut(|xs| tokio::spawn(async move {
+                let xs = xs.into_deref_mut();
+                let mut stream = RefMut::window_clusters_mut(xs, 4).enumerate();
+                while let Some((i, cluster)) = stream.next().await {
+                    cluster.for_each(|xs| {
+                        assert_eq!(xs.get(0), Some(&(i as u8)));
+                    });
+                }
+            }))
+            .await;
     }
 }
